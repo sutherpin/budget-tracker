@@ -1379,7 +1379,7 @@ async function handleUpdateTransactionNotes(request, env) {
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
-  const { notes } = body;
+  const { notes, categoryId } = body;
   if (notes === void 0) {
     return jsonResponse({ error: "notes field is required" }, 400);
   }
@@ -1397,6 +1397,25 @@ async function handleUpdateTransactionNotes(request, env) {
         notes = excluded.notes,
         updated_at = excluded.updated_at`
       ).bind(transactionId, notes, now).run();
+    }
+    if (categoryId !== void 0) {
+      const status = categoryId ? "categorized" : "pending";
+      await env.DB.prepare(
+        `UPDATE transactions SET category_id = ?, status = ?, categorized_at = ? WHERE id = ?`
+      ).bind(categoryId || null, status, categoryId ? now : null, transactionId).run();
+      if (categoryId) {
+        const txn = await env.DB.prepare("SELECT merchant FROM transactions WHERE id = ?").bind(transactionId).first();
+        if (txn?.merchant) {
+          await env.DB.prepare(
+            `INSERT INTO merchant_category_map (merchant, category_id, times_used, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(merchant) DO UPDATE SET
+            category_id = excluded.category_id,
+            times_used = merchant_category_map.times_used + 1,
+            updated_at = excluded.updated_at`
+          ).bind(txn.merchant, categoryId, now).run();
+        }
+      }
     }
     console.log(`Successfully saved notes for transaction ${transactionId}`);
     return jsonResponse({ success: true });
