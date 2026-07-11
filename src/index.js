@@ -100,12 +100,35 @@ async function sendPush(env, subscription, payload) {
       await env.DB.prepare(
         "DELETE FROM push_subscriptions WHERE endpoint = ?"
       ).bind(endpoint).run();
+    } else if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      console.error(`Push send non-OK status ${res.status} for ${endpoint.slice(0, 60)}: ${bodyText}`);
+    } else {
+      console.log(`Push send OK (${res.status}) for ${endpoint.slice(0, 60)}`);
     }
   } catch (err) {
     console.error("Push send failed:", err);
   }
 }
 __name(sendPush, "sendPush");
+async function notifyMacroDroid(env, text) {
+  if (!env.MACRODROID_WEBHOOK_URL) return;
+  try {
+    const res = await fetch(env.MACRODROID_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: text
+    });
+    if (!res.ok) {
+      console.error(`MacroDroid webhook non-OK status ${res.status}`);
+    } else {
+      console.log(`MacroDroid webhook notified OK (${res.status})`);
+    }
+  } catch (err) {
+    console.error("MacroDroid webhook failed:", err);
+  }
+}
+__name(notifyMacroDroid, "notifyMacroDroid");
 async function buildVapidHeaders(publicKey, privateKey, subject, endpoint) {
   const origin = new URL(endpoint).origin;
   const now = Math.floor(Date.now() / 1e3);
@@ -747,6 +770,7 @@ async function handleIncomingSms(request, env, ctx) {
     body: `$${parsed.amount.toFixed(2)} \u2014 tap to categorize`,
                                      transactionId
   }));
+  ctx.waitUntil(notifyMacroDroid(env, `New charge: ${parsed.merchant || "Unknown"} \u2014 $${parsed.amount.toFixed(2)}`));
   return jsonResponse({ success: true, transactionId, parsed, suggestedCategoryId });
 }
 __name(handleIncomingSms, "handleIncomingSms");

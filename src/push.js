@@ -51,6 +51,11 @@ async function sendPush(env, subscription, payload) {
       await env.DB.prepare(
         'DELETE FROM push_subscriptions WHERE endpoint = ?'
       ).bind(endpoint).run();
+    } else if (!res.ok) {
+      const bodyText = await res.text().catch(() => '');
+      console.error(`Push send non-OK status ${res.status} for ${endpoint.slice(0, 60)}: ${bodyText}`);
+    } else {
+      console.log(`Push send OK (${res.status}) for ${endpoint.slice(0, 60)}`);
     }
   } catch (err) {
     console.error('Push send failed:', err);
