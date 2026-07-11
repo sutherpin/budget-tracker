@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head><title>Plaid Test</title></head>
+<body>
+  <button id="link-btn">Connect Bank</button>
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <script>
+    document.getElementById('link-btn').onclick = async () => {
+      const res = await fetch('/create_link_token', { method: 'POST' });
+      const { link_token } = await res.json();
+      const handler = Plaid.create({
+        token: link_token,
+        onSuccess: async (public_token) => {
+          await fetch('/exchange_token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ public_token }),
+          });
+          alert('Connected! Check server console for access token.');
+        },
+        onExit: (err, metadata) => {
+          console.log('EXIT ERROR:', err);
+          console.log('METADATA:', metadata);
+        },
+      });
+      handler.open();
+    };
+  </script>
+</body>
+</html>

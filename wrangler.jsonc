@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "budget-tracker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-29",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "budget-tracker-db",
+      "database_id": "9ac2463c-d889-4266-8d69-492ca6465bdd"
+    }
+  ]
+}

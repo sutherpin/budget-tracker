@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1729" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Budget Tracker</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="loading" class="loading-screen">
+      <div class="loading-logo">$</div>
+      <div class="loading-text">Budget Tracker</div>
+    </div>
+
+    <div id="main" class="hidden">
+
+<header class="topbar">
+        <button class="month-nav" id="btn-prev-month">‹</button>
+        <div class="topbar-month" id="topbar-month">June 2026</div>
+        <button class="month-nav" id="btn-next-month">›</button>
+        <div class="topbar-badge hidden" id="pending-badge">0</div>
+      </header>
+
+      <div class="view active" id="view-dashboard">
+        <div class="dashboard-hero">
+          <div class="pie-wrap">
+            <canvas id="pie-chart" width="520" height="520"></canvas>
+            <div class="pie-center">
+              <div class="pie-center-label">Remaining</div>
+              <div class="pie-center-amount" id="pie-remaining">$0</div>
+            </div>
+            <div class="pie-tooltip hidden" id="pie-tooltip"></div>
+          </div>
+          <div class="hero-stats">
+            <div class="stat">
+              <span class="stat-label">Budgeted</span>
+              <span class="stat-value" id="stat-budgeted">$0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Spent</span>
+              <span class="stat-value spent" id="stat-spent">$0</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-label">Categories</div>
+        <div class="category-list" id="category-list"></div>
+      </div>
+
+      <div class="view" id="view-pending">
+        <div class="section-label">Needs Categorizing</div>
+        <div class="pending-list" id="pending-list">
+          <div class="empty-state">No pending transactions 🎉</div>
+        </div>
+      </div>
+
+      <div class="view" id="view-transactions">
+        <div class="transactions-header">
+          <div class="section-label">Transaction Log</div>
+          <div class="transaction-filters">
+            <select id="transaction-month-filter">
+              <option value="">All Months</option>
+            </select>
+            <select id="transaction-category-filter">
+              <option value="">All Categories</option>
+            </select>
+          </div>
+        </div>
+        <div class="transaction-list" id="transaction-list">
+          <div class="empty-state">No transactions found</div>
+        </div>
+      </div>
+
+      <div class="view" id="view-settings">
+        <div class="section-label">Monthly Budgets</div>
+        <div class="settings-list" id="settings-list"></div>
+        <button class="btn-save" id="btn-save-budgets">Save Budgets</button>
+
+        <div class="section-label" style="margin-top:2rem">Manual Transaction</div>
+        <div class="add-manual">
+          <input type="text" id="manual-description" placeholder="Description (e.g., Coffee)" maxlength="64" />
+          <input type="number" id="manual-amount" placeholder="Amount" step="0.01" min="0" />
+          <select id="manual-category">
+            <option value="">Category (optional)</option>
+          </select>
+          <input type="date" id="manual-date" />
+          <label class="manual-auto-cat">
+            <input type="checkbox" id="manual-auto-categorize" />
+            <span>Auto-categorize</span>
+          </label>
+          <button class="btn-add-manual" id="btn-add-manual">Add Transaction</button>
+        </div>
+
+        <div class="section-label" style="margin-top:2rem">Recurring Transactions</div>
+        <div class="add-recurring">
+          <input type="text" id="recurring-name" placeholder="Transaction name" maxlength="32" />
+          <input type="number" id="recurring-amount" placeholder="Amount" step="0.01" min="0" />
+          <select id="recurring-category">
+            <option value="">Select category...</option>
+          </select>
+          <input type="number" id="recurring-day" placeholder="Day of month (1-31)" min="1" max="31" />
+          <input type="date" id="recurring-start" />
+          <input type="date" id="recurring-end" />
+          <button class="btn-add-recurring" id="btn-add-recurring">Add Recurring</button>
+        </div>
+        <div class="recurring-list" id="recurring-list"></div>
+
+        <div class="section-label" style="margin-top:2rem">Categories</div>
+        <div class="add-category">
+          <input type="text" id="new-cat-name" placeholder="Category name" maxlength="32" />
+          <input type="text" id="new-cat-icon" placeholder="🏷️" maxlength="4" />
+          <input type="color" id="new-cat-color" value="#6366f1" />
+          <button class="btn-add-cat" id="btn-add-cat" type="button">Add</button>
+        </div>
+
+        <!-- New Button for Notifications -->
+        <div class="section-label" style="margin-top:2rem">Notifications</div>
+        <button class="btn-enable-notifications" id="btn-enable-notifications">Enable Notifications</button>
+        <!-- End New Button -->
+
+        <!-- Import/Export Buttons -->
+        <div class="section-label" style="margin-top:2rem">Data Backup</div>
+        <div class="backup-buttons">
+          <button class="btn-export" id="btn-export">Export Database</button>
+          <button class="btn-import" id="btn-import">Import Database</button>
+          <input type="file" id="import-file-input" accept=".csv" class="hidden" />
+        </div>
+
+        <!-- CSV Transaction Import -->
+        <div class="section-label" style="margin-top:2rem">CSV Transaction Import</div>
+        <div class="csv-import-section">
+          <p class="csv-import-description">Import transactions from your bank's CSV export (current month only, duplicates ignored)</p>
+          <button class="btn-csv-import" id="btn-csv-import">Import CSV Transactions</button>
+          <input type="file" id="csv-file-input" accept=".csv" class="hidden" />
+        </div>
+        <!-- End CSV Transaction Import -->
+
+      </div>
+
+      <nav class="bottom-nav">
+        <button class="nav-btn active" data-view="dashboard">
+          <span class="nav-icon">◉</span>
+          <span class="nav-label">Dashboard</span>
+        </button>
+        <button class="nav-btn" data-view="pending">
+          <span class="nav-icon">⏳</span>
+          <span class="nav-label">Pending</span>
+        </button>
+        <button class="nav-btn" data-view="settings">
+          <span class="nav-icon">⚙</span>
+          <span class="nav-label">Settings</span>
+        </button>
+        <button class="nav-btn" data-view="transactions">
+          <span class="nav-icon">📋</span>
+          <span class="nav-label">Transactions</span>
+        </button>
+      </nav>
+    </div>
+
+    <div class="modal hidden" id="modal-categorize">
+      <div class="modal-card">
+        <div class="modal-merchant" id="modal-merchant">MERCHANT</div>
+        <div class="modal-amount" id="modal-amount">$0.00</div>
+        <div class="modal-date" id="modal-date"></div>
+        <div class="modal-label">Choose a category</div>
+        <div class="modal-cats" id="modal-cats"></div>
+        <button class="btn-skip" id="btn-skip">Skip for now</button>
+      </div>
+    </div>
+
+    <div class="modal hidden" id="modal-notes">
+      <div class="modal-card">
+        <div class="modal-notes-header">
+          <div class="notes-merchant" id="notes-merchant">MERCHANT</div>
+          <div class="notes-amount" id="notes-amount">$0.00</div>
+          <div class="notes-date" id="notes-date"></div>
+        </div>
+        <div class="modal-label">Add/Edit Notes</div>
+        <textarea id="notes-input" placeholder="Add notes about this transaction..." maxlength="255"></textarea>
+        <div class="modal-label">Change Category</div>
+        <select id="notes-category" class="notes-category-select">
+          <option value="">No category</option>
+        </select>
+        <div class="modal-notes-buttons">
+          <button class="btn-cancel-notes" id="btn-cancel-notes">Cancel</button>
+          <button class="btn-save-notes" id="btn-save-notes">Save Notes</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit Category Modal -->
+    <div class="modal hidden" id="modal-edit-category">
+      <div class="modal-card">
+        <div class="modal-label">Edit Category Name</div>
+        <input type="text" id="edit-category-input" placeholder="Category name" maxlength="32">
+        <div class="modal-notes-buttons">
+          <button class="btn-cancel-edit" id="btn-cancel-edit">Cancel</button>
+          <button class="btn-save-edit" id="btn-save-edit">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Category Detail Modal -->
+    <div class="modal hidden" id="modal-category-detail">
+      <div class="modal-card">
+        <div class="category-detail-header">
+          <div class="category-detail-icon" id="category-detail-icon">🏷️</div>
+          <div>
+            <div class="category-detail-name" id="category-detail-name">Category</div>
+            <div class="category-detail-summary" id="category-detail-summary"></div>
+          </div>
+        </div>
+        <div class="category-detail-list" id="category-detail-list"></div>
+        <button class="btn-close-category-detail" id="btn-close-category-detail">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
+
