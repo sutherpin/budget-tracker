@@ -13,8 +13,10 @@ let activeView = 'dashboard';
 let saveBudgetsTimer = null;
 let transactionFilters = {
   month: '',
-  categoryId: ''
+  categoryId: '',
+  search: ''
 };
+let loadedTransactions = [];
 
 window.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) {
@@ -58,6 +60,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('transaction-category-filter').addEventListener('change', (e) => {
     transactionFilters.categoryId = e.target.value;
     loadTransactions();
+  });
+
+  document.getElementById('transaction-search').addEventListener('input', (e) => {
+    transactionFilters.search = e.target.value.trim();
+    renderTransactions(filterTransactionsBySearch(loadedTransactions));
   });
 
   // Add event listener for the new notification button with logging
@@ -1087,10 +1094,21 @@ async function loadTransactions() {
     }
 
     const data = await apiFetch(url);
-    renderTransactions(data.transactions);
+    loadedTransactions = data.transactions;
+    renderTransactions(filterTransactionsBySearch(loadedTransactions));
   } catch (err) {
     console.error('Transactions load failed:', err);
   }
+}
+
+function filterTransactionsBySearch(transactions) {
+  const query = transactionFilters.search.toLowerCase();
+  if (query.length < 3) return transactions;
+  return transactions.filter((txn) => {
+    const merchant = (txn.merchant || '').toLowerCase();
+    const notes = (txn.notes || '').toLowerCase();
+    return merchant.includes(query) || notes.includes(query);
+  });
 }
 
 function renderTransactions(transactions) {
