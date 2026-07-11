@@ -405,6 +405,60 @@ function isCurrentMonth(transactionDate) {
   return txnDate.getFullYear() === now.getFullYear() && txnDate.getMonth() === now.getMonth();
 }
 __name(isCurrentMonth, "isCurrentMonth");
+var AUTO_CATEGORY_RULES = [
+  { category: "Groceries", keywords: ["grocery outlet", "natural grocers", "winco", "yokes"] },
+  { category: "Gas", keywords: ["chevron", "shell", "exxon", "mobil", "arco", "conoco", "phillips 66", "circle k", "texaco", "valero", "sinclair", "bp", "marathon", "speedway", "costco gas", "76"] },
+  { category: "Digital Subscriptions", keywords: ["google", "anthropic", "claude", "apple"] },
+  { category: "Communications", keywords: ["us mobile", "us moble", "spectrum"] }
+];
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+__name(escapeRegExp, "escapeRegExp");
+function matchAutoCategoryLabel(...texts) {
+  const haystack = texts.filter(Boolean).join(" ").toLowerCase();
+  if (!haystack) return null;
+  for (const rule of AUTO_CATEGORY_RULES) {
+    for (const keyword of rule.keywords) {
+      const pattern = new RegExp(`\\b${escapeRegExp(keyword.toLowerCase())}\\b`);
+      if (pattern.test(haystack)) return rule.category;
+    }
+  }
+  return null;
+}
+__name(matchAutoCategoryLabel, "matchAutoCategoryLabel");
+async function resolveCategoryIdByLabel(env, label) {
+  const norm = label.trim().toLowerCase();
+  const { results } = await env.DB.prepare(
+    "SELECT id, name FROM categories WHERE is_active = 1"
+  ).all();
+  let match = results.find((c) => c.name.toLowerCase() === norm);
+  if (!match) {
+    match = results.find((c) => {
+      const cname = c.name.toLowerCase();
+      if (cname.includes(norm) || norm.includes(cname)) return true;
+      return norm.split(/\s+/).some((word) => word.length > 3 && cname.includes(word));
+    });
+  }
+  if (match) return match.id;
+  const insert = await env.DB.prepare(
+    "INSERT INTO categories (name) VALUES (?)"
+  ).bind(label).run();
+  return insert.meta.last_row_id;
+}
+__name(resolveCategoryIdByLabel, "resolveCategoryIdByLabel");
+async function suggestCategoryId(env, merchant, rawText) {
+  if (merchant) {
+    const suggestion = await env.DB.prepare(
+      "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
+    ).bind(merchant).first();
+    if (suggestion) return suggestion.category_id;
+  }
+  const autoLabel = matchAutoCategoryLabel(merchant, rawText);
+  if (autoLabel) return await resolveCategoryIdByLabel(env, autoLabel);
+  return null;
+}
+__name(suggestCategoryId, "suggestCategoryId");
 async function importTransactionsFromCSV(env, csvData, autoResolveDuplicates = true, approvedTransactions = null) {
   const lines = csvData.split("\n").filter((line) => line.trim() !== "");
   if (lines.length < 2) {
@@ -451,12 +505,7 @@ async function importTransactionsFromCSV(env, csvData, autoResolveDuplicates = t
       const now = (/* @__PURE__ */ new Date()).toISOString();
       let suggestedCategoryId = null;
       if (transaction.transactionType === "purchase") {
-        const suggestion = await env.DB.prepare(
-          "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
-        ).bind(transaction.merchant).first();
-        if (suggestion) {
-          suggestedCategoryId = suggestion.category_id;
-        }
+        suggestedCategoryId = await suggestCategoryId(env, transaction.merchant, transaction.rawData);
       }
       const status = transaction.transactionType === "deposit" || transaction.transactionType === "payment" || suggestedCategoryId ? "categorized" : "pending";
       await env.DB.prepare(
@@ -673,15 +722,14 @@ async function handleIncomingSms(request, env, ctx) {
   }
   let suggestedCategoryId = null;
   if (parsed.merchant) {
-    const suggestion = await env.DB.prepare(
-      "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
-    ).bind(parsed.merchant).first();
-    if (suggestion) suggestedCategoryId = suggestion.category_id;
+    suggestedCategoryId = await suggestCategoryId(env, parsed.merchant, smsBody);
   }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const status = !parsed.parsedSuccessfully ? "needs_review" : suggestedCategoryId ? "categorized" : "pending";
   const insertResult = await env.DB.prepare(
     `INSERT INTO transactions
-    (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id, categorized_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     smsBody,
     parsed.amount,
@@ -689,8 +737,9 @@ async function handleIncomingSms(request, env, ctx) {
     parsed.cardLast4,
     parsed.transactionType,
     parsed.occurredAt,
-    parsed.parsedSuccessfully ? "pending" : "needs_review",
-    null
+    status,
+    suggestedCategoryId,
+    status === "categorized" ? now : null
   ).run();
   const transactionId = insertResult.meta.last_row_id;
   ctx.waitUntil(sendPushNotification(env, {
