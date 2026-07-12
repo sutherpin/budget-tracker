@@ -14,6 +14,7 @@ let state = {
 
 let activeView = 'dashboard';
 let saveBudgetsTimer = null;
+let saveCategoryNoteTimer = null;
 let transactionFilters = {
   month: '',
   categoryId: '',
@@ -140,6 +141,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-close-category-detail')?.addEventListener('click', closeCategoryDetail);
   document.getElementById('modal-category-detail')?.addEventListener('click', (e) => {
     if (e.target.id === 'modal-category-detail') closeCategoryDetail();
+  });
+  document.getElementById('category-note-input')?.addEventListener('input', () => {
+    clearTimeout(saveCategoryNoteTimer);
+    saveCategoryNoteTimer = setTimeout(saveCategoryNote, 800);
   });
 
   // Add event listeners for possible-duplicates badge/modal
@@ -800,10 +805,12 @@ async function openCategoryDetail(cat) {
   const nameEl = document.getElementById('category-detail-name');
   const summaryEl = document.getElementById('category-detail-summary');
   const listEl = document.getElementById('category-detail-list');
+  const noteEl = document.getElementById('category-note-input');
 
   iconEl.textContent = cat.icon || '🏷️';
   nameEl.textContent = cat.name;
   summaryEl.textContent = `${fmt(cat.spent)} of ${fmt(cat.allotted)} spent`;
+  if (noteEl) noteEl.value = cat.note || '';
   listEl.innerHTML = '<div class="empty-state">Loading…</div>';
   modal.classList.remove('hidden');
 
@@ -853,6 +860,23 @@ function renderCategoryDetailList(transactions) {
       deleteTransaction(btn.dataset.txnId);
     });
   });
+}
+
+async function saveCategoryNote() {
+  clearTimeout(saveCategoryNoteTimer);
+  if (state.currentCategoryDetailId == null) return;
+  const noteEl = document.getElementById('category-note-input');
+  try {
+    await apiFetch(`/api/categories/${state.currentCategoryDetailId}/note`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ month: state.dashboard.month, note: noteEl.value }),
+    });
+    const cat = state.dashboard.categories.find((c) => c.categoryId === state.currentCategoryDetailId);
+    if (cat) cat.note = noteEl.value;
+  } catch (err) {
+    console.error('Save category note failed:', err);
+  }
 }
 
 function closeCategoryDetail() {

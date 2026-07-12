@@ -643,6 +643,9 @@ var index_default = {
       if (/^\/api\/categories\/\d+\/inclusion$/.test(url.pathname) && request.method === "PATCH") {
         return await handleToggleCategoryInclusion(request, env);
       }
+      if (/^\/api\/categories\/\d+\/note$/.test(url.pathname) && request.method === "PATCH") {
+        return await handleSaveCategoryNote(request, env);
+      }
       if (url.pathname.startsWith("/api/categories/") && request.method === "PATCH") {
         return await handleEditCategory(request, env);
       }
@@ -1492,7 +1495,8 @@ async function handleDashboard(env, url) {
     c.icon,
     c.color,
     COALESCE(b.allotted_amount, 0) AS allotted,
-    COALESCE(SUM(spend.amount), 0) AS spent
+    COALESCE(SUM(spend.amount), 0) AS spent,
+    cn.note AS note
     FROM categories c
     LEFT JOIN budgets b ON b.category_id = c.id AND b.month = (
       SELECT MAX(month) FROM budgets WHERE category_id = c.id AND month <= ?
@@ -1509,10 +1513,11 @@ async function handleDashboard(env, url) {
       WHERE t.transaction_type = 'purchase' AND t.status = 'categorized'
         AND strftime('%Y-%m', t.occurred_at) = ?
     ) spend ON spend.category_id = c.id
+    LEFT JOIN category_notes cn ON cn.category_id = c.id AND cn.month = ?
     WHERE c.is_active = 1 AND c.included_in_budget = 1
     GROUP BY c.id
     ORDER BY c.name`
-  ).bind(month, month, month).all();
+  ).bind(month, month, month, month).all();
   console.log("Raw dashboard results:", results);
   const summary = results.map((row) => ({
     ...row,
@@ -1619,6 +1624,30 @@ async function handleToggleCategoryInclusion(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleToggleCategoryInclusion, "handleToggleCategoryInclusion");
+async function handleSaveCategoryNote(request, env) {
+  const parts = new URL(request.url).pathname.split("/");
+  const id = parts[parts.length - 2];
+  if (!id) {
+    return jsonResponse({ error: "ID is required" }, 400);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { month, note } = body;
+  if (!month) {
+    return jsonResponse({ error: "month is required" }, 400);
+  }
+  await env.DB.prepare(
+    `INSERT INTO category_notes (category_id, month, note, updated_at)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(category_id, month) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`
+  ).bind(id, month, note || null).run();
+  return jsonResponse({ success: true });
+}
+__name(handleSaveCategoryNote, "handleSaveCategoryNote");
 async function handleEditCategory(request, env) {
   const parts = new URL(request.url).pathname.split("/");
   const id = parts[parts.length - 1];

@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS transaction_notes (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Personal per-month reminders on a category (e.g. "why is this over budget").
+-- Scoped by (category_id, month) so a new month naturally starts blank.
+CREATE TABLE IF NOT EXISTS category_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL REFERENCES categories(id),
+    month TEXT NOT NULL,
+    note TEXT,
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(category_id, month)
+);
+
 -- Learns merchant -> category mappings over time
 CREATE TABLE IF NOT EXISTS merchant_category_map (
     merchant TEXT PRIMARY KEY,
