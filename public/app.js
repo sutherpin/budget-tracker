@@ -573,6 +573,7 @@ function renderDashboard(data) {
       <div class="cat-info">
         <div class="cat-name">${cat.name}</div>
         <div class="cat-amounts">${fmt(cat.spent)} of ${fmt(cat.allotted)}</div>
+        ${cat.note ? `<div class="cat-note">${cat.note}</div>` : ''}
         <div class="cat-bar-wrap">
           <div class="cat-bar" style="width:0%;background:${cat.color}" data-pct="${pct}"></div>
         </div>

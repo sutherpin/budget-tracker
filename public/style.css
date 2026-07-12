@@ -626,6 +626,17 @@ html, body {
   color: var(--text-dim);
   margin-top: 2px;
 }
+.cat-note {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
 .cat-bar-wrap {
   height: 24px;
   background: var(--bg3);
