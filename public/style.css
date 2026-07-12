@@ -447,9 +447,9 @@ html, body {
 .mini-pie-legend {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   width: 100%;
-  max-width: 200px;
+  max-width: 320px;
 }
 .mini-pie-legend-empty {
   font-size: 12px;
@@ -458,22 +458,23 @@ html, body {
 }
 .mini-pie-legend-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   font-size: 15px;
 }
 .mini-pie-legend-swatch {
-  width: 9px;
-  height: 9px;
-  border-radius: 3px;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
   flex-shrink: 0;
+  margin-top: 2px;
 }
 .mini-pie-legend-name {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: break-word;
+  padding-left: 22px;
+  text-indent: -22px;
   color: var(--text-dim);
 }
 .mini-pie-legend-amount {
@@ -485,16 +486,16 @@ html, body {
 #legend-over .mini-pie-legend-amount { color: var(--danger); }
 
 @media (max-width: 700px) {
-  .hero-charts { flex-wrap: wrap; gap: 16px; }
+  .hero-charts { flex-direction: column; gap: 24px; }
   .main-pie-wrap {
     order: 1;
-    flex-basis: 100%;
     width: min(520px, 90vw);
     height: min(520px, 90vw);
   }
   #block-under { order: 2; }
   #block-over { order: 3; }
-  .mini-pie-wrap { width: min(170px, 40vw); height: min(170px, 40vw); }
+  .mini-pie-wrap { width: min(220px, 55vw); height: min(220px, 55vw); }
+  .mini-pie-legend { max-width: min(320px, 90vw); }
 }
 .pie-center {
   position: absolute;
