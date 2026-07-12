@@ -12,12 +12,22 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/style.css" />
+  <script>
+    (function () {
+      var theme = localStorage.getItem('theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
 </head>
 <body>
   <div id="app">
     <div id="loading" class="loading-screen">
       <div class="loading-logo">$</div>
       <div class="loading-text">Budget Tracker</div>
+      <div class="loading-progress-bar">
+        <div class="loading-progress-fill" id="loading-progress-fill"></div>
+      </div>
+      <div class="loading-status" id="loading-status">Starting up…</div>
     </div>
 
     <div id="main" class="hidden">
@@ -26,18 +36,66 @@
         <button class="month-nav" id="btn-prev-month">‹</button>
         <div class="topbar-month" id="topbar-month">June 2026</div>
         <button class="month-nav" id="btn-next-month">›</button>
-        <div class="topbar-badge hidden" id="pending-badge">0</div>
+        <div class="topbar-badges">
+          <button class="btn-theme-toggle" id="btn-theme-toggle" title="Toggle day/night mode">🌙</button>
+          <div class="topbar-badge topbar-badge-duplicate hidden" id="duplicate-badge" title="Possible duplicate transactions">0</div>
+          <div class="topbar-badge hidden" id="pending-badge" title="Transactions needing categorization">0</div>
+        </div>
       </header>
+
+      <div class="account-balance-bar">
+        <div class="account-balance hidden" id="account-balance">
+          <div class="account-balance-row">
+            <div class="account-balance-item">
+              <span class="account-balance-label">Checking</span>
+              <span class="account-balance-amount" id="account-balance-checking">$0</span>
+            </div>
+            <div class="account-balance-item">
+              <span class="account-balance-label">Savings</span>
+              <span class="account-balance-amount" id="account-balance-savings">$0</span>
+            </div>
+          </div>
+          <div class="account-balance-note" id="account-balance-note"></div>
+        </div>
+        <button class="btn-sync-plaid" id="btn-sync-plaid" title="Pull latest transactions from Plaid now">⟳ Sync now</button>
+        <div class="sync-status hidden" id="sync-status"></div>
+      </div>
 
       <div class="view active" id="view-dashboard">
         <div class="dashboard-hero">
-          <div class="pie-wrap">
-            <canvas id="pie-chart" width="520" height="520"></canvas>
-            <div class="pie-center">
-              <div class="pie-center-label">Remaining</div>
-              <div class="pie-center-amount" id="pie-remaining">$0</div>
+          <div class="hero-charts">
+            <div class="mini-pie-block" id="block-under">
+              <div class="mini-pie-title">Top Under Budget</div>
+              <div class="pie-wrap mini-pie-wrap">
+                <canvas id="pie-chart-under" width="300" height="300"></canvas>
+                <div class="pie-center mini-pie-center">
+                  <div class="pie-center-label">Under</div>
+                  <div class="pie-center-amount mini-amount" id="pie-under-total">$0</div>
+                </div>
+              </div>
+              <div class="mini-pie-legend" id="legend-under"></div>
             </div>
-            <div class="pie-tooltip hidden" id="pie-tooltip"></div>
+
+            <div class="pie-wrap main-pie-wrap">
+              <canvas id="pie-chart" width="520" height="520"></canvas>
+              <div class="pie-center">
+                <div class="pie-center-label">Remaining</div>
+                <div class="pie-center-amount" id="pie-remaining">$0</div>
+              </div>
+              <div class="pie-tooltip hidden" id="pie-tooltip"></div>
+            </div>
+
+            <div class="mini-pie-block" id="block-over">
+              <div class="mini-pie-title">Top Over Budget</div>
+              <div class="pie-wrap mini-pie-wrap">
+                <canvas id="pie-chart-over" width="300" height="300"></canvas>
+                <div class="pie-center mini-pie-center">
+                  <div class="pie-center-label">Over</div>
+                  <div class="pie-center-amount mini-amount" id="pie-over-total">$0</div>
+                </div>
+              </div>
+              <div class="mini-pie-legend" id="legend-over"></div>
+            </div>
           </div>
           <div class="hero-stats">
             <div class="stat">
@@ -65,7 +123,7 @@
       <div class="view" id="view-transactions">
         <div class="transactions-header">
           <div class="section-label">Transaction Log</div>
-          <input type="text" id="transaction-search" class="transaction-search" placeholder="Search transactions..." />
+          <input type="text" id="transaction-search" class="transaction-search" placeholder="Search merchant, notes, or amount..." />
           <div class="transaction-filters">
             <select id="transaction-month-filter">
               <option value="">All Months</option>
@@ -117,7 +175,10 @@
         <div class="section-label" style="margin-top:2rem">Categories</div>
         <div class="add-category">
           <input type="text" id="new-cat-name" placeholder="Category name" maxlength="32" />
-          <input type="text" id="new-cat-icon" placeholder="🏷️" maxlength="4" />
+          <div class="icon-picker">
+            <button type="button" class="icon-picker-toggle" id="new-cat-icon-toggle">🏷️</button>
+            <div class="icon-picker-grid hidden" id="new-cat-icon-grid"></div>
+          </div>
           <input type="color" id="new-cat-color" value="#6366f1" />
           <button class="btn-add-cat" id="btn-add-cat" type="button">Add</button>
         </div>
@@ -190,6 +251,7 @@
         <select id="notes-category" class="notes-category-select">
           <option value="">No category</option>
         </select>
+        <button class="btn-split-transaction" id="btn-split-transaction">✂️ Split into multiple categories</button>
         <div class="modal-notes-buttons">
           <button class="btn-cancel-notes" id="btn-cancel-notes">Cancel</button>
           <button class="btn-save-notes" id="btn-save-notes">Save Notes</button>
@@ -197,11 +259,36 @@
       </div>
     </div>
 
+    <!-- Split Transaction Modal -->
+    <div class="modal hidden" id="modal-split">
+      <div class="modal-card">
+        <div class="modal-notes-header">
+          <div class="notes-merchant" id="split-merchant">MERCHANT</div>
+          <div class="notes-amount" id="split-total">$0.00</div>
+        </div>
+        <div class="modal-label">Split into up to 3 categories</div>
+        <div class="split-rows" id="split-rows"></div>
+        <button class="btn-add-split-row" id="btn-add-split-row">+ Add category</button>
+        <div class="split-remaining" id="split-remaining"></div>
+        <div class="modal-notes-buttons">
+          <button class="btn-cancel-notes" id="btn-cancel-split">Cancel</button>
+          <button class="btn-save-notes" id="btn-save-split">Save Split</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Edit Category Modal -->
     <div class="modal hidden" id="modal-edit-category">
       <div class="modal-card">
-        <div class="modal-label">Edit Category Name</div>
+        <div class="modal-label">Edit Category</div>
         <input type="text" id="edit-category-input" placeholder="Category name" maxlength="32">
+        <div class="modal-label">Icon</div>
+        <div class="icon-picker">
+          <button type="button" class="icon-picker-toggle" id="edit-cat-icon-toggle">🏷️</button>
+          <div class="icon-picker-grid hidden" id="edit-cat-icon-grid"></div>
+        </div>
+        <div class="modal-label">Color</div>
+        <input type="color" id="edit-cat-color" value="#6366f1" />
         <div class="modal-notes-buttons">
           <button class="btn-cancel-edit" id="btn-cancel-edit">Cancel</button>
           <button class="btn-save-edit" id="btn-save-edit">Save</button>
@@ -221,6 +308,15 @@
         </div>
         <div class="category-detail-list" id="category-detail-list"></div>
         <button class="btn-close-category-detail" id="btn-close-category-detail">Close</button>
+      </div>
+    </div>
+
+    <!-- Possible Duplicates Modal -->
+    <div class="modal hidden" id="modal-duplicates">
+      <div class="modal-card">
+        <div class="modal-label">Possible Duplicates</div>
+        <div class="duplicate-list" id="duplicate-list"></div>
+        <button class="btn-close-category-detail" id="btn-close-duplicates">Close</button>
       </div>
     </div>
   </div>

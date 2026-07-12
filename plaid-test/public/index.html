@@ -3,6 +3,7 @@
 <head><title>Plaid Test</title></head>
 <body>
   <button id="link-btn">Connect Bank</button>
+  <button id="update-btn">Re-login Gesa (update mode)</button>
   <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
   <script>
     document.getElementById('link-btn').onclick = async () => {
@@ -17,6 +18,23 @@
             body: JSON.stringify({ public_token }),
           });
           alert('Connected! Check server console for access token.');
+        },
+        onExit: (err, metadata) => {
+          console.log('EXIT ERROR:', err);
+          console.log('METADATA:', metadata);
+        },
+      });
+      handler.open();
+    };
+
+    document.getElementById('update-btn').onclick = async () => {
+      const res = await fetch('/create_update_link_token', { method: 'POST' });
+      const { link_token } = await res.json();
+      const handler = Plaid.create({
+        token: link_token,
+        onSuccess: () => {
+          // Update mode keeps the existing access_token — no exchange call needed.
+          alert('Gesa re-linked! Login refreshed.');
         },
         onExit: (err, metadata) => {
           console.log('EXIT ERROR:', err);

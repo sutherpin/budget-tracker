@@ -5,7 +5,10 @@ let state = {
   dashboard: { month: '', categories: [] },
   pending: [],
   recurringTransactions: [],
+  duplicates: [],
   currentTxn: null,
+  currentSplitTxn: null,
+  currentCategoryDetailId: null,
   currentMonth: new Date().toISOString().slice(0, 7),
 };
 
@@ -18,7 +21,24 @@ let transactionFilters = {
 };
 let loadedTransactions = [];
 
+function applyThemeIcon() {
+  const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  const btn = document.getElementById('btn-theme-toggle');
+  if (btn) btn.textContent = theme === 'light' ? '☀️' : '🌙';
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') || 'dark';
+  const next = current === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  applyThemeIcon();
+}
+
 window.addEventListener('DOMContentLoaded', async () => {
+  applyThemeIcon();
+  document.getElementById('btn-theme-toggle')?.addEventListener('click', toggleTheme);
+
   if ('serviceWorker' in navigator) {
     try {
       await navigator.serviceWorker.register('/sw.js');
@@ -78,18 +98,58 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Add event listeners for notes modal buttons
-  document.getElementById('btn-cancel-notes')?.addEventListener('click', closeNotesModal);
+  document.getElementById('btn-cancel-notes')?.addEventListener('click', () => {
+    closeNotesModal();
+    restoreCategoryDetailModalIfNeeded();
+  });
   document.getElementById('btn-save-notes')?.addEventListener('click', saveNotes);
+  document.getElementById('btn-split-transaction')?.addEventListener('click', openSplitModal);
+
+  // Add event listeners for split modal buttons
+  document.getElementById('btn-cancel-split')?.addEventListener('click', () => {
+    closeSplitModal();
+    restoreCategoryDetailModalIfNeeded();
+  });
+  document.getElementById('btn-save-split')?.addEventListener('click', saveSplit);
+  document.getElementById('btn-add-split-row')?.addEventListener('click', () => addSplitRow());
+  document.getElementById('modal-split')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-split') {
+      closeSplitModal();
+      restoreCategoryDetailModalIfNeeded();
+    }
+  });
+
+  // Icon picker setup
+  initIconPicker('new-cat-icon-toggle', 'new-cat-icon-grid', '🏷️');
+  document.addEventListener('click', (e) => {
+    document.querySelectorAll('.icon-picker-grid').forEach((grid) => {
+      if (!grid.classList.contains('hidden') && !grid.parentElement.contains(e.target)) {
+        grid.classList.add('hidden');
+      }
+    });
+  });
 
   // Add event listeners for edit category modal buttons
   document.getElementById('btn-cancel-edit')?.addEventListener('click', closeEditModal);
   document.getElementById('btn-save-edit')?.addEventListener('click', saveCategoryEdit);
+
+  // Pending badge jumps to the Pending view when clicked
+  document.getElementById('pending-badge')?.addEventListener('click', () => switchView('pending'));
 
   // Add event listener for category detail modal close button
   document.getElementById('btn-close-category-detail')?.addEventListener('click', closeCategoryDetail);
   document.getElementById('modal-category-detail')?.addEventListener('click', (e) => {
     if (e.target.id === 'modal-category-detail') closeCategoryDetail();
   });
+
+  // Add event listeners for possible-duplicates badge/modal
+  document.getElementById('duplicate-badge')?.addEventListener('click', openDuplicatesModal);
+  document.getElementById('btn-close-duplicates')?.addEventListener('click', closeDuplicatesModal);
+  document.getElementById('modal-duplicates')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-duplicates') closeDuplicatesModal();
+  });
+
+  document.getElementById('btn-sync-plaid')?.addEventListener('click', syncPlaidNow);
 
   // Add event listeners for import/export buttons
   document.getElementById('btn-export')?.addEventListener('click', exportDatabase);
@@ -117,8 +177,201 @@ function showApp() {
   document.getElementById('main').classList.remove('hidden');
 }
 
+function setLoadingStatus(text, percent) {
+  const statusEl = document.getElementById('loading-status');
+  const fillEl = document.getElementById('loading-progress-fill');
+  if (statusEl) statusEl.textContent = text;
+  if (fillEl) fillEl.style.width = percent + '%';
+}
+
 async function loadAll() {
-  await Promise.all([loadDashboard(), loadPending(), loadCategories(), loadRecurringTransactions()]);
+  const steps = [
+    { label: 'Dashboard', fn: loadDashboard },
+    { label: 'Pending transactions', fn: loadPending },
+    { label: 'Categories', fn: loadCategories },
+    { label: 'Recurring transactions', fn: loadRecurringTransactions },
+    { label: 'Account balance', fn: loadBalance },
+    { label: 'Duplicate check', fn: loadDuplicates },
+  ];
+  const completedLabels = new Set();
+  setLoadingStatus(`Loading ${steps.map((s) => s.label).join(', ')}…`, 5);
+  await Promise.all(steps.map(async (step) => {
+    await step.fn();
+    completedLabels.add(step.label);
+    const percent = Math.round((completedLabels.size / steps.length) * 100);
+    if (completedLabels.size < steps.length) {
+      const remaining = steps.filter((s) => !completedLabels.has(s.label)).map((s) => s.label);
+      setLoadingStatus(`${step.label} ready — waiting on ${remaining.join(', ')}…`, percent);
+    } else {
+      setLoadingStatus('Ready!', 100);
+    }
+  }));
+}
+
+async function loadDuplicates() {
+  try {
+    const data = await apiFetch('/api/duplicates');
+    state.duplicates = data.duplicates;
+    updateDuplicateBadge(data.duplicates.length);
+  } catch (err) {
+    console.error('Duplicates load failed:', err);
+  }
+}
+
+function updateDuplicateBadge(count) {
+  const badge = document.getElementById('duplicate-badge');
+  if (count > 0) {
+    badge.textContent = count;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function renderDuplicates() {
+  const list = document.getElementById('duplicate-list');
+  if (!state.duplicates.length) {
+    list.innerHTML = '<div class="empty-state">No possible duplicates 🎉</div>';
+    return;
+  }
+  list.innerHTML = '';
+  state.duplicates.forEach((dup) => {
+    const pair = document.createElement('div');
+    pair.className = 'duplicate-pair';
+    const renderTxn = (txn, otherId) => `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">${txn.merchant || 'Unknown merchant'}</div>
+          <div class="duplicate-txn-meta">${formatDate(txn.occurredAt)} · ${txn.source} · #${txn.id}</div>
+        </div>
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(txn.amount)}</div>
+          <button class="btn-keep-duplicate" data-keep="${txn.id}" data-remove="${otherId}">Keep this one</button>
+        </div>
+      </div>
+    `;
+    pair.innerHTML = renderTxn(dup.a, dup.b.id) + renderTxn(dup.b, dup.a.id) +
+      `<button class="btn-dismiss-duplicate" data-flag-id="${dup.flagId}">Not a duplicate — keep both</button>`;
+    pair.querySelectorAll('.btn-keep-duplicate').forEach((btn) => {
+      btn.addEventListener('click', () => resolveDuplicate(dup.flagId, Number(btn.dataset.keep), Number(btn.dataset.remove)));
+    });
+    pair.querySelector('.btn-dismiss-duplicate').addEventListener('click', () => dismissDuplicate(dup.flagId));
+    list.appendChild(pair);
+  });
+}
+
+async function resolveDuplicate(flagId, keepId, removeId) {
+  if (!confirm(`Keep transaction #${keepId} and permanently delete #${removeId}?`)) return;
+  try {
+    await apiFetch(`/api/transactions/${removeId}`, { method: 'DELETE' });
+    state.duplicates = state.duplicates.filter((d) => d.flagId !== flagId);
+    updateDuplicateBadge(state.duplicates.length);
+    renderDuplicates();
+    await loadDashboard();
+    await loadPending();
+    if (activeView === 'transactions') await loadTransactions();
+  } catch (err) {
+    console.error('Resolve duplicate failed:', err);
+    alert('Failed to resolve duplicate');
+  }
+}
+
+async function dismissDuplicate(flagId) {
+  try {
+    await apiFetch(`/api/duplicates/${flagId}/dismiss`, { method: 'POST' });
+    state.duplicates = state.duplicates.filter((d) => d.flagId !== flagId);
+    updateDuplicateBadge(state.duplicates.length);
+    renderDuplicates();
+  } catch (err) {
+    console.error('Dismiss duplicate failed:', err);
+  }
+}
+
+function openDuplicatesModal() {
+  renderDuplicates();
+  document.getElementById('modal-duplicates').classList.remove('hidden');
+}
+
+function closeDuplicatesModal() {
+  document.getElementById('modal-duplicates').classList.add('hidden');
+}
+
+function formatRelativeTime(isoString) {
+  const then = new Date(isoString.includes('T') ? isoString : isoString.replace(' ', 'T') + 'Z');
+  const diffMs = Date.now() - then.getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+async function loadBalance() {
+  try {
+    const data = await apiFetch('/api/plaid/balance');
+    const el = document.getElementById('account-balance');
+    if (data.checking === null && data.savings === null) {
+      el.classList.add('hidden');
+      return;
+    }
+    document.getElementById('account-balance-checking').textContent = fmt(data.checking ?? 0);
+    document.getElementById('account-balance-savings').textContent = fmt(data.savings ?? 0);
+    const noteEl = document.getElementById('account-balance-note');
+    if (noteEl) {
+      noteEl.textContent = data.asOf
+        ? `Updated ${formatRelativeTime(data.asOf)} · refreshes twice daily (12am & 12pm)`
+        : 'Refreshes twice daily (12am & 12pm)';
+    }
+    el.classList.remove('hidden');
+  } catch (err) {
+    console.error('Balance load failed:', err);
+  }
+}
+
+// Mirrors what handlePlaidSyncNow actually does server-side (refresh call,
+// a 5s wait for Plaid to check the bank, then paging through /transactions/sync,
+// then a balance refresh) so the status line means something instead of
+// just saying "syncing" for up to 30s straight.
+const SYNC_STATUS_STEPS = [
+  { at: 0, text: 'Asking Plaid to check your bank…' },
+  { at: 2000, text: 'Waiting for your bank to respond…' },
+  { at: 6000, text: 'Pulling new transactions…' },
+  { at: 14000, text: 'Still pulling — larger syncs take longer…' },
+  { at: 24000, text: 'Updating account balance…' },
+];
+
+async function syncPlaidNow() {
+  const btn = document.getElementById('btn-sync-plaid');
+  const statusEl = document.getElementById('sync-status');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Syncing…';
+  const timers = SYNC_STATUS_STEPS.map((step) => setTimeout(() => {
+    if (statusEl) {
+      statusEl.textContent = step.text;
+      statusEl.classList.remove('hidden');
+    }
+  }, step.at));
+  try {
+    const data = await apiFetch('/api/plaid/sync-now', { method: 'POST' });
+    btn.textContent = data.added > 0 ? `✓ ${data.added} new` : '✓ Up to date';
+    if (statusEl) statusEl.textContent = data.added > 0 ? `Added ${data.added} new transaction(s)` : 'Nothing new since last check';
+    await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates()]);
+    if (activeView === 'transactions') await loadTransactions();
+  } catch (err) {
+    console.error('Plaid sync-now failed:', err);
+    btn.textContent = '✗ Sync failed';
+    if (statusEl) statusEl.textContent = 'Sync failed — check connection and try again';
+  } finally {
+    timers.forEach(clearTimeout);
+    setTimeout(() => {
+      btn.textContent = '⟳ Sync now';
+      btn.disabled = false;
+      if (statusEl) statusEl.classList.add('hidden');
+    }, 3000);
+  }
 }
 
 async function apiFetch(path, options = {}) {
@@ -143,6 +396,13 @@ function changeMonth(delta) {
   const d = new Date(year, month - 1 + delta, 1);
   state.currentMonth = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
   loadDashboard();
+
+  // Keep the Transactions tab's month filter in sync with the top month picker.
+  transactionFilters.month = state.currentMonth;
+  if (activeView === 'transactions') {
+    loadTransactions();
+    populateTransactionFilters();
+  }
 }
 
 async function loadDashboard() {
@@ -292,10 +552,12 @@ function renderDashboard(data) {
   animateNumber(document.getElementById('pie-remaining'), totalBudgeted - totalSpent);
 
   drawPie(data.categories);
+  renderBudgetExtremes(data.categories);
 
   const list = document.getElementById('category-list');
   list.innerHTML = '';
-  data.categories.forEach((cat) => {
+  const sortedCategories = [...data.categories].sort((a, b) => (b.allotted - b.spent) - (a.allotted - a.spent));
+  sortedCategories.forEach((cat) => {
     const pct = cat.allotted > 0 ? Math.min((cat.spent / cat.allotted) * 100, 100) : 0;
     const remaining = cat.allotted - cat.spent;
     const overBudget = remaining < 0;
@@ -446,10 +708,93 @@ function hidePieTooltip() {
   if (tooltip) tooltip.classList.add('hidden');
 }
 
+function renderBudgetExtremes(categories) {
+  const withRemaining = categories.map((c) => ({ ...c, remaining: c.allotted - c.spent }));
+  const over = withRemaining
+    .filter((c) => c.remaining < 0)
+    .sort((a, b) => a.remaining - b.remaining)
+    .slice(0, 3);
+  const under = withRemaining
+    .filter((c) => c.remaining > 0)
+    .sort((a, b) => b.remaining - a.remaining)
+    .slice(0, 3);
+
+  const overTotal = over.reduce((s, c) => s + Math.abs(c.remaining), 0);
+  const underTotal = under.reduce((s, c) => s + c.remaining, 0);
+
+  drawMiniPie('pie-chart-over', over, (c) => Math.abs(c.remaining));
+  drawMiniPie('pie-chart-under', under, (c) => c.remaining);
+  renderMiniLegend('legend-over', over, (c) => Math.abs(c.remaining), 'No categories over budget 🎉');
+  renderMiniLegend('legend-under', under, (c) => c.remaining, 'None yet');
+
+  animateNumber(document.getElementById('pie-over-total'), overTotal);
+  animateNumber(document.getElementById('pie-under-total'), underTotal);
+}
+
+function drawMiniPie(canvasId, cats, valueFn) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const outerR = cx - 6;
+  const innerR = outerR * 0.62;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const total = cats.reduce((s, c) => s + valueFn(c), 0);
+  if (total <= 0) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+    ctx.arc(cx, cy, innerR, 0, Math.PI * 2, true);
+    ctx.fillStyle = '#243055';
+    ctx.fill();
+    return;
+  }
+
+  let startAngle = -Math.PI / 2;
+  const gap = cats.length > 1 ? 0.05 : 0;
+
+  cats.forEach((cat) => {
+    const value = valueFn(cat);
+    const sliceAngle = (value / total) * (Math.PI * 2) - gap;
+    const endAngle = startAngle + sliceAngle;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, outerR, startAngle, endAngle);
+    ctx.arc(cx, cy, innerR, endAngle, startAngle, true);
+    ctx.closePath();
+    ctx.fillStyle = cat.color;
+    ctx.fill();
+    startAngle = endAngle + gap;
+  });
+}
+
+function renderMiniLegend(containerId, cats, valueFn, emptyText) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+  if (!cats.length) {
+    container.innerHTML = `<div class="mini-pie-legend-empty">${emptyText}</div>`;
+    return;
+  }
+  cats.forEach((cat) => {
+    const row = document.createElement('div');
+    row.className = 'mini-pie-legend-row';
+    row.innerHTML = `
+      <span class="mini-pie-legend-swatch" style="background:${cat.color}"></span>
+      <span class="mini-pie-legend-name">${cat.icon || ''} ${cat.name}</span>
+      <span class="mini-pie-legend-amount">${fmt(valueFn(cat))}</span>
+    `;
+    container.appendChild(row);
+  });
+}
+
 // ============================================================
 // Category Detail Modal — shows transactions within a category
 // ============================================================
 async function openCategoryDetail(cat) {
+  state.currentCategoryDetailId = cat.categoryId;
   const modal = document.getElementById('modal-category-detail');
   const iconEl = document.getElementById('category-detail-icon');
   const nameEl = document.getElementById('category-detail-name');
@@ -483,18 +828,48 @@ function renderCategoryDetailList(transactions) {
     item.className = 'transaction-item';
     item.innerHTML = `
       <div class="transaction-info">
-        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}</div>
+        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
         <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
         ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
       </div>
       <div class="transaction-amount">${fmt(txn.amount)}</div>
+      <button class="btn-edit-notes" data-txn-id="${txn.id}">📝</button>
+      <button class="btn-delete-txn" data-txn-id="${txn.id}">🗑️</button>
     `;
     listEl.appendChild(item);
+  });
+
+  listEl.querySelectorAll('.btn-edit-notes').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const transactionId = btn.dataset.txnId;
+      const transaction = transactions.find((t) => t.id == transactionId);
+      openNotesModal(transaction);
+    });
+  });
+  listEl.querySelectorAll('.btn-delete-txn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteTransaction(btn.dataset.txnId);
+    });
   });
 }
 
 function closeCategoryDetail() {
   document.getElementById('modal-category-detail').classList.add('hidden');
+  state.currentCategoryDetailId = null;
+}
+
+async function refreshAfterTransactionChange() {
+  await loadDashboard();
+  await loadPending();
+  await loadDuplicates();
+  if (activeView === 'transactions') await loadTransactions();
+  if (state.currentCategoryDetailId != null) {
+    const cat = state.dashboard.categories.find((c) => c.categoryId === state.currentCategoryDetailId);
+    if (cat) await openCategoryDetail(cat);
+    else closeCategoryDetail();
+  }
 }
 
 async function loadPending() {
@@ -520,7 +895,7 @@ function renderPending(transactions) {
     card.className = 'pending-card';
     card.innerHTML = `
       <div class="pending-info">
-        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}</div>
+        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
         <div class="pending-date">${formatDate(txn.occurred_at)}</div>
       </div>
       <div class="pending-amount">${fmt(txn.amount)}</div>
@@ -758,7 +1133,7 @@ function renderSettings(categories) {
     toggleInput.addEventListener('change', () => toggleCategoryInclusion(cat.id, toggleInput.checked));
 
     const editBtn = row.querySelector('.btn-edit-cat');
-    editBtn.addEventListener('click', () => editCategoryName(cat.id, cat.name));
+    editBtn.addEventListener('click', () => editCategoryName(cat.id, cat.name, cat.icon, cat.color));
 
     const deleteBtn = row.querySelector('.btn-delete-cat');
     deleteBtn.addEventListener('click', () => deleteCategory(cat.id, cat.name));
@@ -797,10 +1172,44 @@ async function deleteCategory(id, name) {
   }
 }
 
+// ============================================================
+// Icon Picker
+// ============================================================
+
+const ICON_CHOICES = [
+  '🛒', '🍽️', '⛽', '💡', '📺', '🛍️', '💊', '🎮', '🏠', '📦', '💳', '🚗',
+  '✈️', '🎓', '👶', '🐾', '💇', '🏋️', '📱', '💻', '🎁', '☕', '🍺', '🏥',
+  '🧾', '💵', '🏦', '🔧', '🎵', '📚', '🧹', '👕', '🏷️'
+];
+
+function initIconPicker(toggleId, gridId, initialIcon) {
+  const toggle = document.getElementById(toggleId);
+  const grid = document.getElementById(gridId);
+  if (!toggle || !grid) return;
+  toggle.textContent = initialIcon || '🏷️';
+  toggle.dataset.value = initialIcon || '🏷️';
+  grid.innerHTML = ICON_CHOICES.map((emoji) =>
+    `<button type="button" class="icon-picker-option" data-emoji="${emoji}">${emoji}</button>`
+  ).join('');
+  grid.classList.add('hidden');
+  toggle.onclick = () => grid.classList.toggle('hidden');
+  grid.querySelectorAll('.icon-picker-option').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      toggle.textContent = btn.dataset.emoji;
+      toggle.dataset.value = btn.dataset.emoji;
+      grid.classList.add('hidden');
+    });
+  });
+}
+
+function getIconPickerValue(toggleId) {
+  return document.getElementById(toggleId)?.dataset.value || '🏷️';
+}
+
 // Global variable to track the category being edited
 let currentEditingCategory = null;
 
-async function editCategoryName(categoryId, currentName) {
+async function editCategoryName(categoryId, currentName, currentIcon, currentColor) {
   // Set the current editing category
   currentEditingCategory = { id: categoryId, name: currentName };
 
@@ -808,6 +1217,8 @@ async function editCategoryName(categoryId, currentName) {
   const modal = document.getElementById('modal-edit-category');
   const input = document.getElementById('edit-category-input');
   input.value = currentName;
+  initIconPicker('edit-cat-icon-toggle', 'edit-cat-icon-grid', currentIcon);
+  document.getElementById('edit-cat-color').value = currentColor || '#6366f1';
   modal.classList.remove('hidden');
 }
 
@@ -827,11 +1238,14 @@ async function saveCategoryEdit() {
     return;
   }
 
+  const icon = getIconPickerValue('edit-cat-icon-toggle');
+  const color = document.getElementById('edit-cat-color').value;
+
   try {
     await apiFetch(`/api/categories/${currentEditingCategory.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName }),
+      body: JSON.stringify({ name: newName, icon, color }),
     });
 
     // Close the modal
@@ -884,7 +1298,7 @@ async function saveBudgets() {
 
 async function addCategory() {
   const name = document.getElementById('new-cat-name').value.trim();
-  const icon = document.getElementById('new-cat-icon').value.trim() || '💳';
+  const icon = getIconPickerValue('new-cat-icon-toggle');
   const color = document.getElementById('new-cat-color').value;
   if (!name) return;
 
@@ -907,7 +1321,8 @@ async function addCategory() {
     }, 1500);
 
     document.getElementById('new-cat-name').value = '';
-    document.getElementById('new-cat-icon').value = '';
+    initIconPicker('new-cat-icon-toggle', 'new-cat-icon-grid', '🏷️');
+    document.getElementById('new-cat-color').value = '#6366f1';
     await loadCategories();
     await loadDashboard();
     // Refresh settings view immediately if we're on it
@@ -1104,10 +1519,16 @@ async function loadTransactions() {
 function filterTransactionsBySearch(transactions) {
   const query = transactionFilters.search.toLowerCase();
   if (query.length < 3) return transactions;
+  const amountQuery = query.replace(/^\$/, '');
+  const isAmountQuery = /^\d+(\.\d{1,2})?$/.test(amountQuery);
   return transactions.filter((txn) => {
     const merchant = (txn.merchant || '').toLowerCase();
     const notes = (txn.notes || '').toLowerCase();
-    return merchant.includes(query) || notes.includes(query);
+    if (merchant.includes(query) || notes.includes(query)) return true;
+    if (isAmountQuery) {
+      return Math.abs(txn.amount).toFixed(2).includes(amountQuery);
+    }
+    return false;
   });
 }
 
@@ -1123,7 +1544,7 @@ function renderTransactions(transactions) {
       item.className = 'transaction-item';
       item.innerHTML = `
         <div class="transaction-info">
-          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}</div>
+          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
           <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
           ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
         </div>
@@ -1139,6 +1560,13 @@ function renderTransactions(transactions) {
         <span class="category-icon" style="color: ${txn.color}">${txn.icon}</span>
         <span class="category-name">${txn.category_name}</span>
       `;
+      item.querySelector('.transaction-info').appendChild(categoryInfo);
+    } else if (txn.is_split && Array.isArray(txn.splits)) {
+      const categoryInfo = document.createElement('div');
+      categoryInfo.className = 'transaction-category';
+      categoryInfo.innerHTML = txn.splits.map((s) =>
+        `<span class="category-icon" style="color: ${s.color}">${s.icon}</span><span class="category-name">${s.name} (${fmt(s.amount)})</span>`
+      ).join('&nbsp;&nbsp;');
       item.querySelector('.transaction-info').appendChild(categoryInfo);
     }
 
@@ -1171,8 +1599,7 @@ async function deleteTransaction(transactionId) {
     await apiFetch(`/api/transactions/${transactionId}`, {
       method: 'DELETE',
     });
-    await loadTransactions(); // Refresh the transaction list
-    await loadDashboard(); // Refresh dashboard in case this affects budget calculations
+    await refreshAfterTransactionChange();
   } catch (err) {
     console.error('Delete transaction failed:', err);
     alert('Failed to delete transaction');
@@ -1226,8 +1653,22 @@ async function populateTransactionFilters() {
 // Notes Modal Functions
 // ============================================================
 
+function hideCategoryDetailModal() {
+  document.getElementById('modal-category-detail')?.classList.add('hidden');
+}
+
+function restoreCategoryDetailModalIfNeeded() {
+  if (state.currentCategoryDetailId != null) {
+    document.getElementById('modal-category-detail')?.classList.remove('hidden');
+  }
+}
+
 function openNotesModal(transaction) {
   state.currentTxn = transaction;
+  // If this was opened from the category-detail modal, hide it underneath
+  // so it can't stack on top of the notes/split modals (both are visible
+  // via .hidden toggling only, so DOM order otherwise decides who wins).
+  hideCategoryDetailModal();
   const modal = document.getElementById('modal-notes');
   document.getElementById('notes-merchant').textContent = transaction.merchant || 'Unknown merchant';
   document.getElementById('notes-amount').textContent = fmt(transaction.amount);
@@ -1255,6 +1696,124 @@ function openNotesModal(transaction) {
   modal.classList.remove('hidden');
 }
 
+// ============================================================
+// Split Transaction Modal Functions
+// ============================================================
+
+async function openSplitModal() {
+  const transactionId = state.currentTxn.id;
+
+  // Close the notes modal and show the split modal immediately so there's
+  // no dead gap while the transaction details are fetched.
+  closeNotesModal();
+  document.getElementById('split-merchant').textContent = 'Loading…';
+  document.getElementById('split-total').textContent = '';
+  document.getElementById('split-rows').innerHTML = '';
+  document.getElementById('split-remaining').textContent = '';
+  document.getElementById('modal-split').classList.remove('hidden');
+
+  let txn;
+  try {
+    txn = await apiFetch(`/api/transactions/${transactionId}`);
+  } catch (err) {
+    console.error('Failed to load transaction for split:', err);
+    alert('Failed to load transaction details');
+    closeSplitModal();
+    return;
+  }
+  state.currentSplitTxn = txn;
+  document.getElementById('split-merchant').textContent = txn.merchant || 'Unknown merchant';
+  document.getElementById('split-total').textContent = fmt(txn.amount);
+
+  const initialRows = txn.is_split && txn.splits?.length
+    ? txn.splits.map((s) => ({ categoryId: s.categoryId, amount: s.amount }))
+    : [{ categoryId: '', amount: '' }, { categoryId: '', amount: '' }];
+  initialRows.forEach((row) => addSplitRow(row.categoryId, row.amount));
+  updateSplitRemaining();
+}
+
+function addSplitRow(categoryId, amount) {
+  const rowsEl = document.getElementById('split-rows');
+  if (rowsEl.children.length >= 3) return;
+
+  const row = document.createElement('div');
+  row.className = 'split-row';
+  const categoryOptions = state.categories.map((cat) =>
+    `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`
+  ).join('');
+  row.innerHTML = `
+    <select class="split-category">
+      <option value="">Choose category</option>
+      ${categoryOptions}
+    </select>
+    <input type="number" class="split-amount" step="0.01" min="0" placeholder="0.00" />
+    <button type="button" class="btn-remove-split-row">✕</button>
+  `;
+  row.querySelector('.split-category').value = categoryId || '';
+  row.querySelector('.split-amount').value = amount || '';
+  row.querySelector('.split-amount').addEventListener('input', updateSplitRemaining);
+  row.querySelector('.split-category').addEventListener('change', updateSplitRemaining);
+  row.querySelector('.btn-remove-split-row').addEventListener('click', () => {
+    if (rowsEl.children.length <= 2) return;
+    row.remove();
+    updateSplitRemaining();
+  });
+  rowsEl.appendChild(row);
+  document.getElementById('btn-add-split-row').disabled = rowsEl.children.length >= 3;
+}
+
+function getSplitRows() {
+  return Array.from(document.querySelectorAll('.split-row')).map((row) => ({
+    categoryId: Number(row.querySelector('.split-category').value) || null,
+    amount: parseFloat(row.querySelector('.split-amount').value) || 0
+  }));
+}
+
+function updateSplitRemaining() {
+  const total = state.currentSplitTxn?.amount || 0;
+  const allocated = getSplitRows().reduce((sum, r) => sum + r.amount, 0);
+  const remaining = Math.round((total - allocated) * 100) / 100;
+  const el = document.getElementById('split-remaining');
+  if (Math.abs(remaining) < 0.01) {
+    el.textContent = `Balanced — ${fmt(total)} total`;
+    el.className = 'split-remaining balanced';
+  } else {
+    el.textContent = `${fmt(Math.abs(remaining))} ${remaining > 0 ? 'remaining' : 'over'}`;
+    el.className = 'split-remaining unbalanced';
+  }
+}
+
+async function saveSplit() {
+  const rows = getSplitRows();
+  if (rows.some((r) => !r.categoryId || r.amount <= 0)) {
+    alert('Every row needs a category and a positive amount');
+    return;
+  }
+  const total = state.currentSplitTxn.amount;
+  const allocated = rows.reduce((sum, r) => sum + r.amount, 0);
+  if (Math.abs(total - allocated) > 0.01) {
+    alert(`Splits must add up to ${fmt(total)} (currently ${fmt(allocated)})`);
+    return;
+  }
+  try {
+    await apiFetch(`/api/transactions/${state.currentSplitTxn.id}/split`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ splits: rows.map((r) => ({ categoryId: r.categoryId, amount: r.amount })) }),
+    });
+    closeSplitModal();
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    console.error('Save split failed:', err);
+    alert(`Failed to save split: ${err.message}`);
+  }
+}
+
+function closeSplitModal() {
+  document.getElementById('modal-split').classList.add('hidden');
+  state.currentSplitTxn = null;
+}
+
 function closeNotesModal() {
   document.getElementById('modal-notes').classList.add('hidden');
   state.currentTxn = null;
@@ -1280,7 +1839,7 @@ async function saveNotes() {
 
     console.log('Notes and category saved successfully, response:', response);
     closeNotesModal();
-    await Promise.all([loadTransactions(), loadDashboard()]); // Refresh both transaction list and dashboard
+    await refreshAfterTransactionChange();
 
     const btn = document.getElementById('btn-save-notes');
     btn.textContent = 'Saved ✓';

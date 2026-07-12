@@ -1,10 +1,11 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
 
 const app = express();
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 const config = new Configuration({
     basePath: PlaidEnvironments[process.env.PLAID_ENV],
@@ -30,6 +31,25 @@ app.post('/create_link_token', async (req, res) => {
     } catch (err) {
         console.error(err.response?.data || err);
         res.status(500).json(err.response?.data || { error: 'link_token_create_failed' });
+    }
+});
+
+// One-off recovery: re-run Link in update mode for the existing Gesa item
+// after it hit ITEM_LOGIN_REQUIRED. No exchange step needed afterward —
+// update mode keeps the same access_token.
+app.post('/create_update_link_token', async (req, res) => {
+    try {
+        const response = await client.linkTokenCreate({
+            user: { client_user_id: 'jason-test-user' },
+            client_name: 'Budget Tracker Test',
+            country_codes: ['US'],
+            language: 'en',
+            access_token: process.env.GESA_ACCESS_TOKEN,
+        });
+        res.json(response.data);
+    } catch (err) {
+        console.error(err.response?.data || err);
+        res.status(500).json(err.response?.data || { error: 'update_link_token_create_failed' });
     }
 });
 

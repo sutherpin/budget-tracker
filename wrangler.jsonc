@@ -13,5 +13,13 @@
       "database_name": "budget-tracker-db",
       "database_id": "9ac2463c-d889-4266-8d69-492ca6465bdd"
     }
-  ]
+  ],
+  // Refreshes the cached Plaid balance twice a day. Times are UTC — 07:00
+  // and 19:00 UTC correspond to midnight and noon Pacific Daylight Time
+  // (UTC-7). During PST (UTC-8, winter) this will run at 11pm/11am local
+  // instead of exact midnight/noon; adjust to "0 8,20 * * *" if that drift
+  // matters.
+  "triggers": {
+    "crons": ["0 7,19 * * *"]
+  }
 }

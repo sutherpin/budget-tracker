@@ -604,6 +604,27 @@ var index_default = {
       if (url.pathname === "/api/sms" && request.method === "POST") {
         return await handleIncomingSms(request, env, ctx);
       }
+      if (url.pathname === "/api/plaid/webhook" && request.method === "POST") {
+        return await handlePlaidWebhook(request, env, ctx);
+      }
+      if (url.pathname === "/api/plaid/sync" && request.method === "POST") {
+        return await handlePlaidManualSync(request, env, ctx);
+      }
+      if (url.pathname === "/api/plaid/sync-now" && request.method === "POST") {
+        return await handlePlaidSyncNow(env, ctx);
+      }
+      if (url.pathname === "/api/plaid/balance" && request.method === "GET") {
+        return await handlePlaidBalance(env);
+      }
+      if (url.pathname === "/api/plaid/balance/refresh" && request.method === "POST") {
+        return await handleRefreshPlaidBalance(request, env);
+      }
+      if (url.pathname === "/api/duplicates" && request.method === "GET") {
+        return await handleGetDuplicates(env);
+      }
+      if (/^\/api\/duplicates\/\d+\/dismiss$/.test(url.pathname) && request.method === "POST") {
+        return await handleDismissDuplicate(request, env);
+      }
       if (url.pathname === "/api/pending" && request.method === "GET") {
         return await handlePending(env);
       }
@@ -648,6 +669,15 @@ var index_default = {
       }
       if (url.pathname === "/api/transactions" && request.method === "GET") {
         return await handleGetTransactions(env, url);
+      }
+      if (/^\/api\/transactions\/\d+$/.test(url.pathname) && request.method === "GET") {
+        return await handleGetSingleTransaction(env, url.pathname.split("/").pop());
+      }
+      if (/^\/api\/transactions\/\d+\/split$/.test(url.pathname) && request.method === "POST") {
+        return await handleSplitTransaction(request, env);
+      }
+      if (/^\/api\/transactions\/\d+\/unsplit$/.test(url.pathname) && request.method === "POST") {
+        return await handleUnsplitTransaction(request, env);
       }
       if (url.pathname.startsWith("/api/transactions/") && request.method === "PATCH") {
         return await handleUpdateTransactionNotes(request, env);
@@ -699,6 +729,9 @@ var index_default = {
     const response = new Response(assetResponse.body, assetResponse);
     response.headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
     return response;
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(refreshPlaidBalanceCache(env).catch((err) => console.error("Scheduled balance refresh failed:", err)));
   }
 };
 async function handleIncomingSms(request, env, ctx) {
@@ -774,9 +807,378 @@ async function handleIncomingSms(request, env, ctx) {
   return jsonResponse({ success: true, transactionId, parsed, suggestedCategoryId });
 }
 __name(handleIncomingSms, "handleIncomingSms");
+var plaidWebhookKeyCache = /* @__PURE__ */ new Map();
+function plaidBaseUrl(env) {
+  return `https://${env.PLAID_ENV}.plaid.com`;
+}
+__name(plaidBaseUrl, "plaidBaseUrl");
+async function plaidFetch(env, path, body) {
+  const res = await fetch(`${plaidBaseUrl(env)}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: env.PLAID_CLIENT_ID,
+      secret: env.PLAID_SECRET,
+      ...body
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Plaid ${path} failed (${res.status}):`, data);
+    throw new Error(data.error_message || `Plaid request to ${path} failed`);
+  }
+  return data;
+}
+__name(plaidFetch, "plaidFetch");
+function base64UrlToBytes(b64url2) {
+  const padded = b64url2.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(b64url2.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+__name(base64UrlToBytes, "base64UrlToBytes");
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(sha256Hex, "sha256Hex");
+async function verifyPlaidWebhook(env, request, rawBody) {
+  try {
+    const jwt = request.headers.get("Plaid-Verification");
+    if (!jwt) return false;
+    const [headerB64, payloadB64, sigB64] = jwt.split(".");
+    if (!headerB64 || !payloadB64 || !sigB64) return false;
+    const header = JSON.parse(new TextDecoder().decode(base64UrlToBytes(headerB64)));
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payloadB64)));
+    if (header.alg !== "ES256") return false;
+    const nowSeconds = Math.floor(Date.now() / 1e3);
+    if (!payload.iat || Math.abs(nowSeconds - payload.iat) > 300) return false;
+    let jwk = plaidWebhookKeyCache.get(header.kid);
+    if (!jwk) {
+      const { key } = await plaidFetch(env, "/webhook_verification_key/get", { key_id: header.kid });
+      jwk = key;
+      plaidWebhookKeyCache.set(header.kid, jwk);
+    }
+    const cryptoKey = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"]
+    );
+    const signatureValid = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      cryptoKey,
+      base64UrlToBytes(sigB64),
+      new TextEncoder().encode(`${headerB64}.${payloadB64}`)
+    );
+    if (!signatureValid) return false;
+    const bodyHash = await sha256Hex(rawBody);
+    return bodyHash === payload.request_body_sha256;
+  } catch (err) {
+    console.error("Plaid webhook verification failed:", err);
+    return false;
+  }
+}
+__name(verifyPlaidWebhook, "verifyPlaidWebhook");
+function normalizeMerchant(merchant) {
+  return (merchant || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+__name(normalizeMerchant, "normalizeMerchant");
+async function findLikelyDuplicate(env, { merchant, amount, occurredAt }) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, merchant FROM transactions
+    WHERE amount = ? AND date(occurred_at) = date(?)`
+  ).bind(amount, occurredAt).all();
+  const incoming = normalizeMerchant(merchant);
+  if (!incoming) return null;
+  for (const row of results) {
+    const existing = normalizeMerchant(row.merchant);
+    if (!existing) continue;
+    const shorter = incoming.length <= existing.length ? incoming : existing;
+    const longer = incoming.length <= existing.length ? existing : incoming;
+    if (shorter.length >= 7 && longer.includes(shorter.slice(0, 7))) {
+      return row;
+    }
+  }
+  return null;
+}
+__name(findLikelyDuplicate, "findLikelyDuplicate");
+var PLAID_MIN_SYNC_DATE = "2026-07-01";
+var DUPLICATE_CHECK_EXCLUDED_KEYWORDS = ["google", "grok", "xai", "anthropic", "claude"];
+function isDuplicateCheckExcluded(merchant) {
+  const haystack = (merchant || "").toLowerCase();
+  return DUPLICATE_CHECK_EXCLUDED_KEYWORDS.some((keyword) => haystack.includes(keyword));
+}
+__name(isDuplicateCheckExcluded, "isDuplicateCheckExcluded");
+async function syncPlaidTransactions(env, ctx, itemRow) {
+  let cursor = itemRow.cursor;
+  let hasMore = true;
+  const added = [];
+  const modified = [];
+  const removed = [];
+  while (hasMore) {
+    const page = await plaidFetch(env, "/transactions/sync", {
+      access_token: itemRow.access_token,
+      cursor: cursor || void 0
+    });
+    added.push(...page.added);
+    modified.push(...page.modified);
+    removed.push(...page.removed);
+    cursor = page.next_cursor;
+    hasMore = page.has_more;
+  }
+  for (const tx of modified) {
+    const merchant = tx.merchant_name || tx.name;
+    await env.DB.prepare(
+      "UPDATE transactions SET amount = ?, merchant = ?, occurred_at = ?, plaid_pending = ? WHERE plaid_transaction_id = ?"
+    ).bind(Math.abs(tx.amount), merchant, tx.date, tx.pending ? 1 : 0, tx.transaction_id).run();
+  }
+  for (const tx of added) {
+    if (tx.date < PLAID_MIN_SYNC_DATE) continue;
+    const merchant = tx.merchant_name || tx.name;
+    const amount = tx.amount;
+    const transactionType = amount < 0 ? "deposit" : "purchase";
+
+    // Plaid links a posted transaction back to the pending one it replaced
+    // via pending_transaction_id. When that's present and we already have
+    // the pending row, update it in place (new plaid_transaction_id, fresh
+    // amount/date/pending flag) instead of inserting a new uncategorized
+    // duplicate — this preserves whatever category/notes/status the user
+    // already set while it was pending.
+    if (tx.pending_transaction_id) {
+      const priorRow = await env.DB.prepare(
+        "SELECT id FROM transactions WHERE plaid_transaction_id = ?"
+      ).bind(tx.pending_transaction_id).first();
+      if (priorRow) {
+        await env.DB.prepare(
+          `UPDATE transactions SET plaid_transaction_id = ?, amount = ?, merchant = ?, occurred_at = ?, transaction_type = ?, plaid_pending = ? WHERE id = ?`
+        ).bind(tx.transaction_id, Math.abs(amount), merchant, tx.date, transactionType, tx.pending ? 1 : 0, priorRow.id).run();
+        console.log(`Linked posted transaction ${tx.transaction_id} to existing row ${priorRow.id} (was pending ${tx.pending_transaction_id})`);
+        continue;
+      }
+    }
+
+    const duplicate = isDuplicateCheckExcluded(merchant) ? null : await findLikelyDuplicate(env, { merchant, amount: Math.abs(amount), occurredAt: tx.date });
+    const suggestedCategoryId = await suggestCategoryId(env, merchant, merchant);
+    const status = suggestedCategoryId ? "categorized" : "pending";
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const insertResult = await env.DB.prepare(
+      `INSERT OR IGNORE INTO transactions
+      (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id, categorized_at, plaid_transaction_id, plaid_pending)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      `Plaid: ${merchant}`,
+      Math.abs(amount),
+      merchant,
+      null,
+      transactionType,
+      tx.date,
+      status,
+      suggestedCategoryId,
+      status === "categorized" ? now : null,
+      tx.transaction_id,
+      tx.pending ? 1 : 0
+    ).run();
+    if (insertResult.meta.changes > 0) {
+      const transactionId = insertResult.meta.last_row_id;
+      if (duplicate) {
+        console.log(`Flagging Plaid transaction ${tx.transaction_id} (row ${transactionId}) as a possible duplicate of transaction ${duplicate.id}`);
+        await env.DB.prepare(
+          "INSERT INTO duplicate_flags (transaction_id, matched_transaction_id) VALUES (?, ?)"
+        ).bind(transactionId, duplicate.id).run();
+      }
+      ctx.waitUntil(sendPushNotification(env, {
+        title: `New charge: ${merchant || "Unknown"}`,
+        body: `$${Math.abs(amount).toFixed(2)} — tap to categorize`,
+                                         transactionId
+      }));
+      ctx.waitUntil(notifyMacroDroid(env, `New charge: ${merchant || "Unknown"} — $${Math.abs(amount).toFixed(2)}`));
+    }
+  }
+  for (const tx of removed) {
+    await env.DB.prepare("DELETE FROM transactions WHERE plaid_transaction_id = ?").bind(tx.transaction_id).run();
+  }
+  await env.DB.prepare(
+    "UPDATE plaid_items SET cursor = ?, updated_at = datetime('now') WHERE id = ?"
+  ).bind(cursor, itemRow.id).run();
+  return { added: added.length, modified: modified.length, removed: removed.length };
+}
+__name(syncPlaidTransactions, "syncPlaidTransactions");
+async function handlePlaidWebhook(request, env, ctx) {
+  const rawBody = await request.text();
+  const verified = await verifyPlaidWebhook(env, request, rawBody);
+  if (!verified) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+  if (payload.webhook_type === "ITEM" && payload.webhook_code === "ERROR") {
+    const itemRow2 = await env.DB.prepare(
+      "SELECT * FROM plaid_items WHERE item_id = ?"
+    ).bind(payload.item_id).first();
+    const institutionName = itemRow2?.institution_name || "Unknown institution";
+    const errorCode = payload.error?.error_code || "UNKNOWN_ERROR";
+    console.error(`Plaid item error for ${institutionName} (${payload.item_id}): ${errorCode}`);
+    ctx.waitUntil(sendPushNotification(env, {
+      title: `Bank connection needs attention: ${institutionName}`,
+      body: errorCode === "ITEM_LOGIN_REQUIRED"
+        ? "Login expired — re-link via Plaid Link update mode to resume syncing."
+        : `Plaid reported an error (${errorCode}) — transactions will stop syncing until this is fixed.`
+    }));
+    ctx.waitUntil(notifyMacroDroid(env, `⚠️ Plaid connection broken for ${institutionName}: ${errorCode}`));
+    return jsonResponse({ success: true, action: "item_error_reported" });
+  }
+  if (payload.webhook_type !== "TRANSACTIONS" || !["SYNC_UPDATES_AVAILABLE", "INITIAL_UPDATE", "HISTORICAL_UPDATE"].includes(payload.webhook_code)) {
+    return jsonResponse({ success: true, action: "ignored" });
+  }
+  const itemRow = await env.DB.prepare(
+    "SELECT * FROM plaid_items WHERE item_id = ?"
+  ).bind(payload.item_id).first();
+  if (!itemRow) {
+    console.error(`Plaid webhook for unknown item_id: ${payload.item_id}`);
+    return jsonResponse({ success: true, action: "unknown_item" });
+  }
+  try {
+    await syncPlaidTransactions(env, ctx, itemRow);
+  } catch (err) {
+    console.error("Plaid sync failed:", err);
+    return jsonResponse({ error: "Sync failed" }, 500);
+  }
+  return jsonResponse({ success: true });
+}
+__name(handlePlaidWebhook, "handlePlaidWebhook");
+async function handlePlaidManualSync(request, env, ctx) {
+  const providedSecret = request.headers.get("X-Budget-Secret");
+  if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+  const { results } = await env.DB.prepare("SELECT * FROM plaid_items").all();
+  const summary = [];
+  for (const itemRow of results) {
+    try {
+      const counts = await syncPlaidTransactions(env, ctx, itemRow);
+      summary.push({ item_id: itemRow.item_id, success: true, ...counts });
+    } catch (err) {
+      console.error(`Manual Plaid sync failed for item ${itemRow.item_id}:`, err);
+      summary.push({ item_id: itemRow.item_id, success: false, error: err.message });
+    }
+  }
+  return jsonResponse({ success: true, results: summary });
+}
+__name(handlePlaidManualSync, "handlePlaidManualSync");
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+__name(sleep, "sleep");
+async function handlePlaidSyncNow(env, ctx) {
+  const { results } = await env.DB.prepare("SELECT * FROM plaid_items").all();
+  let added = 0;
+  const errors = [];
+  for (const itemRow of results) {
+    try {
+      // /transactions/sync only reads Plaid's already-cached ledger — it
+      // won't see anything the bank posted since Plaid's last background
+      // refresh. /transactions/refresh asks Plaid to go check the
+      // institution right now; give it a few seconds to land before syncing.
+      await plaidFetch(env, "/transactions/refresh", { access_token: itemRow.access_token });
+      await sleep(5000);
+      const counts = await syncPlaidTransactions(env, ctx, itemRow);
+      added += counts.added;
+    } catch (err) {
+      console.error(`UI-triggered Plaid sync failed for item ${itemRow.item_id}:`, err);
+      errors.push({ item_id: itemRow.item_id, error: err.message });
+    }
+  }
+  try {
+    await refreshPlaidBalanceCache(env);
+  } catch (err) {
+    console.error("UI-triggered balance refresh failed:", err);
+  }
+  return jsonResponse({ success: errors.length === 0, added, errors });
+}
+__name(handlePlaidSyncNow, "handlePlaidSyncNow");
+var BALANCE_ACCOUNT_MASKS = { checking: "2250", savings: "3735" };
+async function refreshPlaidBalanceCache(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM plaid_items").all();
+  const existing = await env.DB.prepare("SELECT checking, savings FROM balance_cache WHERE id = 1").first();
+  let checking = existing?.checking ?? null;
+  let savings = existing?.savings ?? null;
+  for (const itemRow of results) {
+    try {
+      const data = await plaidFetch(env, "/accounts/balance/get", { access_token: itemRow.access_token });
+      for (const account of data.accounts) {
+        if (account.mask === BALANCE_ACCOUNT_MASKS.checking) {
+          checking = account.balances.current;
+        } else if (account.mask === BALANCE_ACCOUNT_MASKS.savings) {
+          savings = account.balances.current;
+        }
+      }
+    } catch (err) {
+      console.error(`Balance fetch failed for item ${itemRow.item_id}:`, err);
+    }
+  }
+  await env.DB.prepare(
+    `INSERT INTO balance_cache (id, checking, savings, updated_at) VALUES (1, ?, ?, datetime('now'))
+    ON CONFLICT(id) DO UPDATE SET checking = excluded.checking, savings = excluded.savings, updated_at = excluded.updated_at`
+  ).bind(checking, savings).run();
+  return { checking, savings };
+}
+__name(refreshPlaidBalanceCache, "refreshPlaidBalanceCache");
+async function handlePlaidBalance(env) {
+  const row = await env.DB.prepare("SELECT checking, savings, updated_at FROM balance_cache WHERE id = 1").first();
+  if (!row) {
+    return jsonResponse({ checking: null, savings: null });
+  }
+  return jsonResponse({ checking: row.checking, savings: row.savings, asOf: row.updated_at });
+}
+__name(handlePlaidBalance, "handlePlaidBalance");
+async function handleRefreshPlaidBalance(request, env) {
+  const providedSecret = request.headers.get("X-Budget-Secret");
+  if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+  const result = await refreshPlaidBalanceCache(env);
+  return jsonResponse({ success: true, ...result });
+}
+__name(handleRefreshPlaidBalance, "handleRefreshPlaidBalance");
+async function handleGetDuplicates(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT
+    df.id AS flagId,
+    df.created_at AS flaggedAt,
+    a.id AS aId, a.merchant AS aMerchant, a.amount AS aAmount, a.occurred_at AS aOccurredAt, a.plaid_transaction_id AS aPlaidId,
+    b.id AS bId, b.merchant AS bMerchant, b.amount AS bAmount, b.occurred_at AS bOccurredAt, b.plaid_transaction_id AS bPlaidId
+    FROM duplicate_flags df
+    JOIN transactions a ON a.id = df.transaction_id
+    JOIN transactions b ON b.id = df.matched_transaction_id
+    WHERE df.resolved = 0
+    ORDER BY df.created_at DESC`
+  ).all();
+  const duplicates = results.map((row) => ({
+    flagId: row.flagId,
+    flaggedAt: row.flaggedAt,
+    a: { id: row.aId, merchant: row.aMerchant, amount: row.aAmount, occurredAt: row.aOccurredAt, source: row.aPlaidId ? "Plaid" : "Other" },
+    b: { id: row.bId, merchant: row.bMerchant, amount: row.bAmount, occurredAt: row.bOccurredAt, source: row.bPlaidId ? "Plaid" : "Other" }
+  }));
+  return jsonResponse({ duplicates });
+}
+__name(handleGetDuplicates, "handleGetDuplicates");
+async function handleDismissDuplicate(request, env) {
+  const parts = new URL(request.url).pathname.split("/");
+  const flagId = parts[parts.length - 2];
+  await env.DB.prepare("UPDATE duplicate_flags SET resolved = 1 WHERE id = ?").bind(flagId).run();
+  return jsonResponse({ success: true });
+}
+__name(handleDismissDuplicate, "handleDismissDuplicate");
 async function handlePending(env) {
   const { results } = await env.DB.prepare(
-    `SELECT id, amount, merchant, card_last4, transaction_type, occurred_at, status
+    `SELECT id, amount, merchant, card_last4, transaction_type, occurred_at, status, plaid_pending
     FROM transactions
     WHERE status IN ('pending', 'needs_review')
     ORDER BY occurred_at DESC`
@@ -1090,16 +1492,27 @@ async function handleDashboard(env, url) {
     c.icon,
     c.color,
     COALESCE(b.allotted_amount, 0) AS allotted,
-                                           COALESCE(SUM(CASE WHEN t.transaction_type = 'purchase' THEN t.amount ELSE 0 END), 0) AS spent
-                                           FROM categories c
-                                           LEFT JOIN budgets b ON b.category_id = c.id AND b.month = ?
-                                           LEFT JOIN transactions t ON t.category_id = c.id
-                                           AND t.status = 'categorized'
-                                           AND strftime('%Y-%m', t.occurred_at) = ?
-                                           WHERE c.is_active = 1 AND c.included_in_budget = 1
-                                           GROUP BY c.id
-                                           ORDER BY c.name`
-  ).bind(month, month).all();
+    COALESCE(SUM(spend.amount), 0) AS spent
+    FROM categories c
+    LEFT JOIN budgets b ON b.category_id = c.id AND b.month = (
+      SELECT MAX(month) FROM budgets WHERE category_id = c.id AND month <= ?
+    )
+    LEFT JOIN (
+      SELECT t.category_id AS category_id, t.amount AS amount
+      FROM transactions t
+      WHERE t.transaction_type = 'purchase' AND t.status = 'categorized' AND t.is_split = 0
+        AND strftime('%Y-%m', t.occurred_at) = ?
+      UNION ALL
+      SELECT ts.category_id AS category_id, ts.amount AS amount
+      FROM transaction_splits ts
+      JOIN transactions t ON t.id = ts.transaction_id
+      WHERE t.transaction_type = 'purchase' AND t.status = 'categorized'
+        AND strftime('%Y-%m', t.occurred_at) = ?
+    ) spend ON spend.category_id = c.id
+    WHERE c.is_active = 1 AND c.included_in_budget = 1
+    GROUP BY c.id
+    ORDER BY c.name`
+  ).bind(month, month, month).all();
   console.log("Raw dashboard results:", results);
   const summary = results.map((row) => ({
     ...row,
@@ -1341,32 +1754,88 @@ async function handlePushSubscribe(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handlePushSubscribe, "handlePushSubscribe");
+async function attachSplits(env, transactions) {
+  const splitIds = transactions.filter((t) => t.is_split).map((t) => t.id);
+  if (!splitIds.length) return transactions;
+  const placeholders = splitIds.map(() => "?").join(",");
+  const { results: splitRows } = await env.DB.prepare(
+    `SELECT ts.transaction_id, ts.category_id, ts.amount, c.name, c.icon, c.color
+    FROM transaction_splits ts
+    JOIN categories c ON c.id = ts.category_id
+    WHERE ts.transaction_id IN (${placeholders})`
+  ).bind(...splitIds).all();
+  const byTxn = {};
+  for (const row of splitRows) {
+    (byTxn[row.transaction_id] ||= []).push({ categoryId: row.category_id, amount: row.amount, name: row.name, icon: row.icon, color: row.color });
+  }
+  return transactions.map((t) => t.is_split ? { ...t, splits: byTxn[t.id] || [] } : t);
+}
+__name(attachSplits, "attachSplits");
 async function handleGetTransactions(env, url) {
   const month = url.searchParams.get("month");
   const categoryId = url.searchParams.get("categoryId");
-  let query = `
-  SELECT t.id, t.amount, t.merchant, t.occurred_at, t.status,
-  COALESCE(n.notes, '') AS notes,
-  c.id AS category_id, c.name AS category_name, c.icon, c.color
-  FROM transactions t
-  LEFT JOIN categories c ON t.category_id = c.id
-  LEFT JOIN transaction_notes n ON t.id = n.transaction_id
-  WHERE t.transaction_type = 'purchase'
-  `;
   const params = [];
-  if (month) {
-    query += ` AND strftime('%Y-%m', t.occurred_at) = ?`;
-    params.push(month);
-  }
+  let query;
   if (categoryId) {
-    query += ` AND t.category_id = ?`;
+    query = `
+    SELECT t.id, t.amount, t.merchant, t.occurred_at, t.status, t.is_split, t.plaid_pending,
+    COALESCE(n.notes, '') AS notes,
+    c.id AS category_id, c.name AS category_name, c.icon, c.color
+    FROM transactions t
+    LEFT JOIN categories c ON t.category_id = c.id
+    LEFT JOIN transaction_notes n ON t.id = n.transaction_id
+    WHERE t.transaction_type = 'purchase' AND t.category_id = ? AND t.is_split = 0
+    ${month ? "AND strftime('%Y-%m', t.occurred_at) = ?" : ""}
+    UNION ALL
+    SELECT t.id, ts.amount, t.merchant, t.occurred_at, t.status, t.is_split, t.plaid_pending,
+    COALESCE(n.notes, '') AS notes,
+    c.id AS category_id, c.name AS category_name, c.icon, c.color
+    FROM transactions t
+    JOIN transaction_splits ts ON ts.transaction_id = t.id
+    JOIN categories c ON c.id = ts.category_id
+    LEFT JOIN transaction_notes n ON t.id = n.transaction_id
+    WHERE t.transaction_type = 'purchase' AND ts.category_id = ? AND t.is_split = 1
+    ${month ? "AND strftime('%Y-%m', t.occurred_at) = ?" : ""}
+    ORDER BY occurred_at DESC
+    `;
     params.push(categoryId);
+    if (month) params.push(month);
+    params.push(categoryId);
+    if (month) params.push(month);
+  } else {
+    query = `
+    SELECT t.id, t.amount, t.merchant, t.occurred_at, t.status, t.is_split, t.plaid_pending,
+    COALESCE(n.notes, '') AS notes,
+    c.id AS category_id, c.name AS category_name, c.icon, c.color
+    FROM transactions t
+    LEFT JOIN categories c ON t.category_id = c.id
+    LEFT JOIN transaction_notes n ON t.id = n.transaction_id
+    WHERE t.transaction_type = 'purchase'
+    ${month ? "AND strftime('%Y-%m', t.occurred_at) = ?" : ""}
+    ORDER BY t.occurred_at DESC
+    `;
+    if (month) params.push(month);
   }
-  query += ` ORDER BY t.occurred_at DESC`;
   const { results } = await env.DB.prepare(query).bind(...params).all();
-  return jsonResponse({ transactions: results });
+  const transactions = categoryId ? results : await attachSplits(env, results);
+  return jsonResponse({ transactions });
 }
 __name(handleGetTransactions, "handleGetTransactions");
+async function handleGetSingleTransaction(env, transactionId) {
+  const txn = await env.DB.prepare(
+    `SELECT t.id, t.amount, t.merchant, t.occurred_at, t.status, t.is_split, t.plaid_pending,
+    COALESCE(n.notes, '') AS notes,
+    c.id AS category_id, c.name AS category_name, c.icon, c.color
+    FROM transactions t
+    LEFT JOIN categories c ON t.category_id = c.id
+    LEFT JOIN transaction_notes n ON t.id = n.transaction_id
+    WHERE t.id = ?`
+  ).bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  const [withSplits] = await attachSplits(env, [txn]);
+  return jsonResponse(withSplits);
+}
+__name(handleGetSingleTransaction, "handleGetSingleTransaction");
 async function handleUpdateTransactionNotes(request, env) {
   const parts = new URL(request.url).pathname.split("/");
   const transactionId = parts[parts.length - 1];
@@ -1400,8 +1869,9 @@ async function handleUpdateTransactionNotes(request, env) {
     }
     if (categoryId !== void 0) {
       const status = categoryId ? "categorized" : "pending";
+      await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
       await env.DB.prepare(
-        `UPDATE transactions SET category_id = ?, status = ?, categorized_at = ? WHERE id = ?`
+        `UPDATE transactions SET category_id = ?, status = ?, categorized_at = ?, is_split = 0 WHERE id = ?`
       ).bind(categoryId || null, status, categoryId ? now : null, transactionId).run();
       if (categoryId) {
         const txn = await env.DB.prepare("SELECT merchant FROM transactions WHERE id = ?").bind(transactionId).first();
@@ -1426,6 +1896,53 @@ async function handleUpdateTransactionNotes(request, env) {
   }
 }
 __name(handleUpdateTransactionNotes, "handleUpdateTransactionNotes");
+async function handleSplitTransaction(request, env) {
+  const parts = new URL(request.url).pathname.split("/");
+  const transactionId = parts[parts.length - 2];
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const splits = body.splits;
+  if (!Array.isArray(splits) || splits.length < 2 || splits.length > 3) {
+    return jsonResponse({ error: "Provide 2 or 3 splits" }, 400);
+  }
+  for (const s of splits) {
+    if (!s.categoryId || typeof s.amount !== "number" || s.amount <= 0) {
+      return jsonResponse({ error: "Each split needs a categoryId and a positive amount" }, 400);
+    }
+  }
+  const txn = await env.DB.prepare("SELECT amount FROM transactions WHERE id = ?").bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  const total = splits.reduce((sum, s) => sum + s.amount, 0);
+  if (Math.abs(total - txn.amount) > 0.01) {
+    return jsonResponse({ error: `Splits must sum to ${txn.amount.toFixed(2)}, got ${total.toFixed(2)}` }, 400);
+  }
+  await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+  for (const s of splits) {
+    await env.DB.prepare(
+      "INSERT INTO transaction_splits (transaction_id, category_id, amount) VALUES (?, ?, ?)"
+    ).bind(transactionId, s.categoryId, s.amount).run();
+  }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await env.DB.prepare(
+    "UPDATE transactions SET is_split = 1, category_id = NULL, status = 'categorized', categorized_at = ? WHERE id = ?"
+  ).bind(now, transactionId).run();
+  return jsonResponse({ success: true });
+}
+__name(handleSplitTransaction, "handleSplitTransaction");
+async function handleUnsplitTransaction(request, env) {
+  const parts = new URL(request.url).pathname.split("/");
+  const transactionId = parts[parts.length - 2];
+  await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+  await env.DB.prepare(
+    "UPDATE transactions SET is_split = 0, category_id = NULL, status = 'pending', categorized_at = NULL WHERE id = ?"
+  ).bind(transactionId).run();
+  return jsonResponse({ success: true });
+}
+__name(handleUnsplitTransaction, "handleUnsplitTransaction");
 async function handleDeleteTransaction(request, env) {
   const parts = new URL(request.url).pathname.split("/");
   const transactionId = parts[parts.length - 1];
@@ -1433,6 +1950,7 @@ async function handleDeleteTransaction(request, env) {
     return jsonResponse({ error: "Transaction ID is required" }, 400);
   }
   await env.DB.prepare("DELETE FROM transaction_notes WHERE transaction_id = ?").bind(transactionId).run();
+  await env.DB.prepare("DELETE FROM duplicate_flags WHERE transaction_id = ? OR matched_transaction_id = ?").bind(transactionId, transactionId).run();
   await env.DB.prepare("DELETE FROM transactions WHERE id = ?").bind(transactionId).run();
   return jsonResponse({ success: true });
 }
