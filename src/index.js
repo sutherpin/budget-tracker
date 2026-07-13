@@ -801,12 +801,14 @@ async function handleIncomingSms(request, env, ctx) {
     status === "categorized" ? now : null
   ).run();
   const transactionId = insertResult.meta.last_row_id;
-  ctx.waitUntil(sendPushNotification(env, {
-    title: `New charge: ${parsed.merchant || "Unknown"}`,
-    body: `$${parsed.amount.toFixed(2)} \u2014 tap to categorize`,
-                                     transactionId
-  }));
-  ctx.waitUntil(notifyMacroDroid(env, `New charge: ${parsed.merchant || "Unknown"} \u2014 $${parsed.amount.toFixed(2)}`));
+  if (status !== "categorized") {
+    ctx.waitUntil(sendPushNotification(env, {
+      title: `New charge: ${parsed.merchant || "Unknown"}`,
+      body: `$${parsed.amount.toFixed(2)} \u2014 tap to categorize`,
+                                       transactionId
+    }));
+    ctx.waitUntil(notifyMacroDroid(env, `New charge: ${parsed.merchant || "Unknown"} \u2014 $${parsed.amount.toFixed(2)}`));
+  }
   return jsonResponse({ success: true, transactionId, parsed, suggestedCategoryId });
 }
 __name(handleIncomingSms, "handleIncomingSms");
@@ -994,12 +996,14 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
           "INSERT INTO duplicate_flags (transaction_id, matched_transaction_id) VALUES (?, ?)"
         ).bind(transactionId, duplicate.id).run();
       }
-      ctx.waitUntil(sendPushNotification(env, {
-        title: `New charge: ${merchant || "Unknown"}`,
-        body: `$${Math.abs(amount).toFixed(2)} — tap to categorize`,
-                                         transactionId
-      }));
-      ctx.waitUntil(notifyMacroDroid(env, `New charge: ${merchant || "Unknown"} — $${Math.abs(amount).toFixed(2)}`));
+      if (status !== "categorized") {
+        ctx.waitUntil(sendPushNotification(env, {
+          title: `New charge: ${merchant || "Unknown"}`,
+          body: `$${Math.abs(amount).toFixed(2)} — tap to categorize`,
+                                           transactionId
+        }));
+        ctx.waitUntil(notifyMacroDroid(env, `New charge: ${merchant || "Unknown"} — $${Math.abs(amount).toFixed(2)}`));
+      }
     }
   }
   for (const tx of removed) {
