@@ -554,7 +554,10 @@ function renderDashboard(data) {
 
   document.getElementById('stat-budgeted').textContent = fmt(totalBudgeted);
   document.getElementById('stat-spent').textContent = fmt(totalSpent);
-  animateNumber(document.getElementById('pie-remaining'), totalBudgeted - totalSpent);
+  const remaining = totalBudgeted - totalSpent;
+  const pieRemainingEl = document.getElementById('pie-remaining');
+  pieRemainingEl.style.color = remaining < 0 ? '#ff3b30' : '#34c759';
+  animateNumber(pieRemainingEl, remaining);
 
   drawPie(data.categories);
   renderBudgetExtremes(data.categories);
