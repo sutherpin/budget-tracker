@@ -620,7 +620,7 @@ var index_default = {
         return await handleRefreshPlaidBalance(request, env);
       }
       if (url.pathname === "/api/plaid/link-token" && request.method === "POST") {
-        return await handlePlaidCreateLinkToken(env);
+        return await handlePlaidCreateLinkToken(request, env);
       }
       if (url.pathname === "/api/plaid/exchange" && request.method === "POST") {
         return await handlePlaidExchangeToken(request, env);
@@ -1165,13 +1165,18 @@ async function handleRefreshPlaidBalance(request, env) {
   return jsonResponse({ success: true, ...result });
 }
 __name(handleRefreshPlaidBalance, "handleRefreshPlaidBalance");
-async function handlePlaidCreateLinkToken(env) {
+async function handlePlaidCreateLinkToken(request, env) {
+  const origin = new URL(request.url).origin;
   const data = await plaidFetch(env, "/link/token/create", {
     user: { client_user_id: "budget-tracker-primary-user" },
     client_name: "Budget Tracker",
     products: ["transactions"],
     country_codes: ["US"],
-    language: "en"
+    language: "en",
+    // Required for OAuth institutions (e.g. Discover, Chase) to complete the
+    // bank-hosted login step and hand control back to Link. Must also be
+    // added to the Plaid Dashboard's Allowed Redirect URIs.
+    redirect_uri: `${origin}/`
   });
   return jsonResponse({ link_token: data.link_token });
 }

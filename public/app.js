@@ -176,6 +176,11 @@ window.addEventListener('DOMContentLoaded', async () => {
     showApp();
     // Removed automatic registerPush() call
   }
+
+  if (window.location.href.includes('oauth_state_id=')) {
+    switchView('settings');
+    resumePlaidOAuthIfNeeded();
+  }
 });
 
 function showApp() {
@@ -401,6 +406,49 @@ async function loadLinkedAccounts() {
   }
 }
 
+// OAuth institutions (Discover, Chase, etc.) send the user to the bank's own
+// login page, then redirect back to us with an `oauth_state_id` query param.
+// Link has to be re-opened with the *same* link_token plus the redirect URL
+// to resume where it left off, so we stash the token across that reload.
+function createPlaidLinkHandler(token, btn) {
+  const isOAuthResume = window.location.href.includes('oauth_state_id=');
+  return Plaid.create({
+    token,
+    receivedRedirectUri: isOAuthResume ? window.location.href : void 0,
+    onSuccess: async (public_token, metadata) => {
+      sessionStorage.removeItem('plaid_link_token');
+      if (btn) btn.textContent = 'Connecting…';
+      try {
+        await apiFetch('/api/plaid/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            public_token,
+            institution_name: metadata?.institution?.name || null
+          })
+        });
+        await loadLinkedAccounts();
+      } catch (err) {
+        console.error('Plaid exchange failed:', err);
+        alert('Connected to Plaid, but saving the account failed. Please try again.');
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '+ Connect a bank';
+        }
+      }
+    },
+    onExit: (err) => {
+      sessionStorage.removeItem('plaid_link_token');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '+ Connect a bank';
+      }
+      if (err) console.error('Plaid Link exited with error:', err);
+    }
+  });
+}
+
 async function connectBank() {
   const btn = document.getElementById('btn-connect-bank');
   if (!btn || typeof Plaid === 'undefined') return;
@@ -408,41 +456,23 @@ async function connectBank() {
   btn.textContent = 'Loading…';
   try {
     const { link_token } = await apiFetch('/api/plaid/link-token', { method: 'POST' });
-    const handler = Plaid.create({
-      token: link_token,
-      onSuccess: async (public_token, metadata) => {
-        btn.textContent = 'Connecting…';
-        try {
-          await apiFetch('/api/plaid/exchange', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              public_token,
-              institution_name: metadata?.institution?.name || null
-            })
-          });
-          await loadLinkedAccounts();
-        } catch (err) {
-          console.error('Plaid exchange failed:', err);
-          alert('Connected to Plaid, but saving the account failed. Please try again.');
-        } finally {
-          btn.disabled = false;
-          btn.textContent = '+ Connect a bank';
-        }
-      },
-      onExit: (err) => {
-        btn.disabled = false;
-        btn.textContent = '+ Connect a bank';
-        if (err) console.error('Plaid Link exited with error:', err);
-      }
-    });
-    handler.open();
+    sessionStorage.setItem('plaid_link_token', link_token);
+    createPlaidLinkHandler(link_token, btn).open();
   } catch (err) {
     console.error('Creating Plaid link token failed:', err);
     btn.disabled = false;
     btn.textContent = '+ Connect a bank';
     alert('Could not start bank connection. Please try again.');
   }
+}
+
+function resumePlaidOAuthIfNeeded() {
+  if (typeof Plaid === 'undefined') return;
+  const token = sessionStorage.getItem('plaid_link_token');
+  if (!token) return;
+  const btn = document.getElementById('btn-connect-bank');
+  createPlaidLinkHandler(token, btn).open();
+  window.history.replaceState({}, document.title, window.location.pathname);
 }
 
 async function apiFetch(path, options = {}) {
