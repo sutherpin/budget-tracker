@@ -558,6 +558,7 @@ function renderDashboard(data) {
 
   drawPie(data.categories);
   renderBudgetExtremes(data.categories);
+  renderTopMerchants(data.topMerchants || []);
 
   const list = document.getElementById('category-list');
   list.innerHTML = '';
@@ -590,93 +591,98 @@ function renderDashboard(data) {
   });
 }
 
-let pieSlices = [];
-let pieHoverBound = false;
+const chartSlices = {}; // canvasId -> [{ startAngle, endAngle, innerR, outerR, cx, cy, data }]
+const chartHoverBound = {}; // canvasId -> bool
 
 function drawPie(categories) {
-  const canvas = document.getElementById('pie-chart');
+  const cats = categories.filter((c) => c.spent > 0);
+  drawDonut('pie-chart', 'pie-tooltip', cats.map((cat) => ({
+    label: cat.name, icon: cat.icon, color: cat.color, amount: cat.spent
+  })), { outerR: 220, innerR: 144, gap: 0.03 });
+}
+
+function drawDonut(canvasId, tooltipId, items, { outerR, innerR, gap } = {}) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
-  const outerR = 220;
-  const innerR = 144;
-
-  const cats = categories.filter((c) => c.spent > 0);
-  const total = cats.reduce((s, c) => s + c.spent, 0);
+  const or = outerR ?? cx - 6;
+  const ir = innerR ?? or * 0.62;
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  pieSlices = [];
+  chartSlices[canvasId] = [];
 
-  if (total === 0) {
+  const total = items.reduce((s, item) => s + item.amount, 0);
+  if (total <= 0) {
     ctx.beginPath();
-    ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
-    ctx.arc(cx, cy, innerR, 0, Math.PI * 2, true);
+    ctx.arc(cx, cy, or, 0, Math.PI * 2);
+    ctx.arc(cx, cy, ir, 0, Math.PI * 2, true);
     ctx.fillStyle = '#243055';
     ctx.fill();
-    hidePieTooltip();
+    hideChartTooltip(tooltipId);
     return;
   }
 
   let startAngle = -Math.PI / 2;
-  const gap = 0.03;
+  const sliceGap = gap ?? (items.length > 1 ? 0.05 : 0);
 
-  cats.forEach((cat) => {
-    const sliceAngle = (cat.spent / total) * (Math.PI * 2) - gap;
+  items.forEach((item) => {
+    const sliceAngle = (item.amount / total) * (Math.PI * 2) - sliceGap;
     const endAngle = startAngle + sliceAngle;
     ctx.beginPath();
     ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, outerR, startAngle, endAngle);
-    ctx.arc(cx, cy, innerR, endAngle, startAngle, true);
+    ctx.arc(cx, cy, or, startAngle, endAngle);
+    ctx.arc(cx, cy, ir, endAngle, startAngle, true);
     ctx.closePath();
-    ctx.fillStyle = cat.color;
+    ctx.fillStyle = item.color;
     ctx.fill();
-    pieSlices.push({ cat, startAngle, endAngle, innerR, outerR, cx, cy });
-    startAngle = endAngle + gap;
+    chartSlices[canvasId].push({ startAngle, endAngle, innerR: ir, outerR: or, cx, cy, data: item });
+    startAngle = endAngle + sliceGap;
   });
 
-  bindPieHoverEvents(canvas);
+  bindChartHover(canvasId, tooltipId);
 }
 
-function bindPieHoverEvents(canvas) {
-  if (pieHoverBound) return;
-  pieHoverBound = true;
+function bindChartHover(canvasId, tooltipId) {
+  if (chartHoverBound[canvasId]) return;
+  chartHoverBound[canvasId] = true;
 
-  canvas.addEventListener('mousemove', (e) => {
+  const canvas = document.getElementById(canvasId);
+  const wrap = canvas.closest('.pie-wrap');
+  if (!canvas || !wrap) return;
+
+  const pick = (clientX, clientY) => {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
+    const x = (clientX - rect.left) * scaleX;
+    const y = (clientY - rect.top) * scaleY;
+    return findSliceAt(chartSlices[canvasId] || [], x, y);
+  };
 
-    const slice = findPieSliceAt(x, y);
-    if (slice) {
-      showPieTooltip(slice.cat, e.clientX, e.clientY);
-    } else {
-      hidePieTooltip();
-    }
+  canvas.addEventListener('mousemove', (e) => {
+    const slice = pick(e.clientX, e.clientY);
+    if (slice) showChartTooltip(tooltipId, wrap, slice.data, e.clientX, e.clientY);
+    else hideChartTooltip(tooltipId);
   });
 
-  canvas.addEventListener('mouseleave', hidePieTooltip);
+  canvas.addEventListener('mouseleave', () => hideChartTooltip(tooltipId));
 
   // Basic touch support: tap a slice to show its tooltip briefly.
   canvas.addEventListener('touchstart', (e) => {
     const touch = e.touches[0];
     if (!touch) return;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const x = (touch.clientX - rect.left) * scaleX;
-    const y = (touch.clientY - rect.top) * scaleY;
-    const slice = findPieSliceAt(x, y);
+    const slice = pick(touch.clientX, touch.clientY);
     if (slice) {
-      showPieTooltip(slice.cat, touch.clientX, touch.clientY);
-      setTimeout(hidePieTooltip, 1800);
+      showChartTooltip(tooltipId, wrap, slice.data, touch.clientX, touch.clientY);
+      setTimeout(() => hideChartTooltip(tooltipId), 1800);
     }
   }, { passive: true });
 }
 
-function findPieSliceAt(x, y) {
-  for (const slice of pieSlices) {
+function findSliceAt(slices, x, y) {
+  for (const slice of slices) {
     const dx = x - slice.cx;
     const dy = y - slice.cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
@@ -694,23 +700,22 @@ function findPieSliceAt(x, y) {
   return null;
 }
 
-function showPieTooltip(cat, clientX, clientY) {
-  const tooltip = document.getElementById('pie-tooltip');
-  const wrap = document.querySelector('.pie-wrap');
+function showChartTooltip(tooltipId, wrap, data, clientX, clientY) {
+  const tooltip = document.getElementById(tooltipId);
   if (!tooltip || !wrap) return;
 
   const wrapRect = wrap.getBoundingClientRect();
   tooltip.innerHTML = `
-    <div class="pie-tooltip-name"><span class="pie-tooltip-swatch" style="background:${cat.color}"></span>${cat.icon || ''} ${cat.name}</div>
-    <div class="pie-tooltip-amount">${fmt(cat.spent)}</div>
+    <div class="pie-tooltip-name"><span class="pie-tooltip-swatch" style="background:${data.color}"></span>${data.icon || ''} ${data.label}</div>
+    <div class="pie-tooltip-amount">${fmt(data.amount)}</div>
   `;
   tooltip.style.left = `${clientX - wrapRect.left}px`;
   tooltip.style.top = `${clientY - wrapRect.top}px`;
   tooltip.classList.remove('hidden');
 }
 
-function hidePieTooltip() {
-  const tooltip = document.getElementById('pie-tooltip');
+function hideChartTooltip(tooltipId) {
+  const tooltip = document.getElementById(tooltipId);
   if (tooltip) tooltip.classList.add('hidden');
 }
 
@@ -728,8 +733,12 @@ function renderBudgetExtremes(categories) {
   const overTotal = over.reduce((s, c) => s + Math.abs(c.remaining), 0);
   const underTotal = under.reduce((s, c) => s + c.remaining, 0);
 
-  drawMiniPie('pie-chart-over', over, (c) => Math.abs(c.remaining));
-  drawMiniPie('pie-chart-under', under, (c) => c.remaining);
+  drawDonut('pie-chart-over', 'pie-tooltip-over', over.map((c) => ({
+    label: c.name, icon: c.icon, color: c.color, amount: Math.abs(c.remaining)
+  })), { outerR: 220, innerR: 144 });
+  drawDonut('pie-chart-under', 'pie-tooltip-under', under.map((c) => ({
+    label: c.name, icon: c.icon, color: c.color, amount: c.remaining
+  })), { outerR: 220, innerR: 144 });
   renderMiniLegend('legend-over', over, (c) => Math.abs(c.remaining), 'No categories over budget 🎉');
   renderMiniLegend('legend-under', under, (c) => c.remaining, 'None yet');
 
@@ -737,43 +746,23 @@ function renderBudgetExtremes(categories) {
   animateNumber(document.getElementById('pie-under-total'), underTotal);
 }
 
-function drawMiniPie(canvasId, cats, valueFn) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const cx = canvas.width / 2;
-  const cy = canvas.height / 2;
-  const outerR = cx - 6;
-  const innerR = outerR * 0.62;
+// Distinct palette from category colors, since merchants have no color of their own.
+const MERCHANT_PALETTE = ['#7c3aed', '#0ea5e9', '#f43f5e', '#f59e0b', '#10b981'];
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+function renderTopMerchants(topMerchants) {
+  const merchants = topMerchants.map((m, i) => ({
+    name: m.merchant,
+    icon: '💸',
+    color: MERCHANT_PALETTE[i % MERCHANT_PALETTE.length],
+    total: m.total
+  }));
+  const total = merchants.reduce((s, m) => s + m.total, 0);
 
-  const total = cats.reduce((s, c) => s + valueFn(c), 0);
-  if (total <= 0) {
-    ctx.beginPath();
-    ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
-    ctx.arc(cx, cy, innerR, 0, Math.PI * 2, true);
-    ctx.fillStyle = '#243055';
-    ctx.fill();
-    return;
-  }
-
-  let startAngle = -Math.PI / 2;
-  const gap = cats.length > 1 ? 0.05 : 0;
-
-  cats.forEach((cat) => {
-    const value = valueFn(cat);
-    const sliceAngle = (value / total) * (Math.PI * 2) - gap;
-    const endAngle = startAngle + sliceAngle;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, outerR, startAngle, endAngle);
-    ctx.arc(cx, cy, innerR, endAngle, startAngle, true);
-    ctx.closePath();
-    ctx.fillStyle = cat.color;
-    ctx.fill();
-    startAngle = endAngle + gap;
-  });
+  drawDonut('pie-chart-merchants', 'pie-tooltip-merchants', merchants.map((m) => ({
+    label: m.name, icon: m.icon, color: m.color, amount: m.total
+  })), { outerR: 220, innerR: 144 });
+  renderMiniLegend('legend-merchants', merchants, (m) => m.total, 'No spending yet');
+  animateNumber(document.getElementById('pie-merchants-total'), total);
 }
 
 function renderMiniLegend(containerId, cats, valueFn, emptyText) {
@@ -1388,6 +1377,16 @@ function fmt(amount) {
 
 function formatDate(dateStr) {
   if (!dateStr) return '';
+  // Date-only strings ("YYYY-MM-DD") have no time-of-day info (most Plaid
+  // transactions). Parsing them with `new Date()` treats them as UTC
+  // midnight, which shifts to the wrong local day/time — so render them as
+  // a plain local calendar date instead of fabricating a clock time.
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
+  if (dateOnly) {
+    const [year, month, day] = dateStr.split('-').map(Number);
+    const d2 = new Date(year, month - 1, day);
+    return d2.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
   const d = new Date(dateStr);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
@@ -2047,7 +2046,13 @@ function showDuplicateResolutionDialog(duplicateIndex) {
 
   // Format dates for display
   const formatDateForDisplay = (dateStr) => {
-    const date = new Date(dateStr);
+    let date;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      const [year, month, day] = dateStr.split('-').map(Number);
+      date = new Date(year, month - 1, day);
+    } else {
+      date = new Date(dateStr);
+    }
     return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',

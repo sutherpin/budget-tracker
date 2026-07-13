@@ -414,19 +414,32 @@ html, body {
   position: relative;
 }
 .main-pie-wrap {
-  order: 2;
   width: min(380px, 42vw);
   height: min(380px, 42vw);
 }
-#pie-chart { display: block; width: 100%; height: 100%; cursor: pointer; }
-.mini-pie-block {
+#pie-chart, #pie-chart-under, #pie-chart-over, #pie-chart-merchants {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+.stats-charts {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 40px;
+  padding: 8px 20px 24px;
+}
+.stats-block {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
 }
-#block-under { order: 1; }
-#block-over { order: 3; }
+.stats-block .main-pie-wrap {
+  width: min(380px, 80vw);
+  height: min(380px, 80vw);
+}
 .mini-pie-title {
   font-size: 14px;
   font-weight: 700;
@@ -435,15 +448,9 @@ html, body {
   color: var(--text-dim);
   text-align: center;
 }
-.mini-pie-wrap {
-  width: min(285px, 31.5vw);
-  height: min(285px, 31.5vw);
-}
-#pie-chart-under, #pie-chart-over { display: block; width: 100%; height: 100%; }
-.mini-pie-center .pie-center-label { font-size: 10px; }
-.mini-pie-center .mini-amount { font-size: 25px; margin-top: 2px; }
 #pie-over-total { color: #ff3b30; }
 #pie-under-total { color: #007aff; }
+#pie-merchants-total { color: #7c3aed; }
 .mini-pie-legend {
   display: flex;
   flex-direction: column;
@@ -484,17 +491,13 @@ html, body {
 }
 #legend-under .mini-pie-legend-amount { color: #007aff; }
 #legend-over .mini-pie-legend-amount { color: var(--danger); }
+#legend-merchants .mini-pie-legend-amount { color: #7c3aed; }
 
 @media (max-width: 700px) {
-  .hero-charts { flex-direction: column; gap: 24px; }
   .main-pie-wrap {
-    order: 1;
     width: min(520px, 90vw);
     height: min(520px, 90vw);
   }
-  #block-under { order: 2; }
-  #block-over { order: 3; }
-  .mini-pie-wrap { width: min(220px, 55vw); height: min(220px, 55vw); }
   .mini-pie-legend { max-width: min(320px, 90vw); }
 }
 .pie-center {

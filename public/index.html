@@ -64,18 +64,6 @@
       <div class="view active" id="view-dashboard">
         <div class="dashboard-hero">
           <div class="hero-charts">
-            <div class="mini-pie-block" id="block-under">
-              <div class="mini-pie-title">Top Under Budget</div>
-              <div class="pie-wrap mini-pie-wrap">
-                <canvas id="pie-chart-under" width="300" height="300"></canvas>
-                <div class="pie-center mini-pie-center">
-                  <div class="pie-center-label">Under</div>
-                  <div class="pie-center-amount mini-amount" id="pie-under-total">$0</div>
-                </div>
-              </div>
-              <div class="mini-pie-legend" id="legend-under"></div>
-            </div>
-
             <div class="pie-wrap main-pie-wrap">
               <canvas id="pie-chart" width="520" height="520"></canvas>
               <div class="pie-center">
@@ -83,18 +71,6 @@
                 <div class="pie-center-amount" id="pie-remaining">$0</div>
               </div>
               <div class="pie-tooltip hidden" id="pie-tooltip"></div>
-            </div>
-
-            <div class="mini-pie-block" id="block-over">
-              <div class="mini-pie-title">Top Over Budget</div>
-              <div class="pie-wrap mini-pie-wrap">
-                <canvas id="pie-chart-over" width="300" height="300"></canvas>
-                <div class="pie-center mini-pie-center">
-                  <div class="pie-center-label">Over</div>
-                  <div class="pie-center-amount mini-amount" id="pie-over-total">$0</div>
-                </div>
-              </div>
-              <div class="mini-pie-legend" id="legend-over"></div>
             </div>
           </div>
           <div class="hero-stats">
@@ -135,6 +111,50 @@
         </div>
         <div class="transaction-list" id="transaction-list">
           <div class="empty-state">No transactions found</div>
+        </div>
+      </div>
+
+      <div class="view" id="view-spending-stats">
+        <div class="section-label">Spending Stats</div>
+        <div class="stats-charts">
+          <div class="stats-block">
+            <div class="mini-pie-title">Top Under Budget</div>
+            <div class="pie-wrap main-pie-wrap">
+              <canvas id="pie-chart-under" width="520" height="520"></canvas>
+              <div class="pie-center">
+                <div class="pie-center-label">Under</div>
+                <div class="pie-center-amount" id="pie-under-total">$0</div>
+              </div>
+              <div class="pie-tooltip hidden" id="pie-tooltip-under"></div>
+            </div>
+            <div class="mini-pie-legend" id="legend-under"></div>
+          </div>
+
+          <div class="stats-block">
+            <div class="mini-pie-title">Top Over Budget</div>
+            <div class="pie-wrap main-pie-wrap">
+              <canvas id="pie-chart-over" width="520" height="520"></canvas>
+              <div class="pie-center">
+                <div class="pie-center-label">Over</div>
+                <div class="pie-center-amount" id="pie-over-total">$0</div>
+              </div>
+              <div class="pie-tooltip hidden" id="pie-tooltip-over"></div>
+            </div>
+            <div class="mini-pie-legend" id="legend-over"></div>
+          </div>
+
+          <div class="stats-block">
+            <div class="mini-pie-title">Top 5 Merchants (Outflow)</div>
+            <div class="pie-wrap main-pie-wrap">
+              <canvas id="pie-chart-merchants" width="520" height="520"></canvas>
+              <div class="pie-center">
+                <div class="pie-center-label">Total</div>
+                <div class="pie-center-amount" id="pie-merchants-total">$0</div>
+              </div>
+              <div class="pie-tooltip hidden" id="pie-tooltip-merchants"></div>
+            </div>
+            <div class="mini-pie-legend" id="legend-merchants"></div>
+          </div>
         </div>
       </div>
 
@@ -215,6 +235,10 @@
         <button class="nav-btn" data-view="pending">
           <span class="nav-icon">⏳</span>
           <span class="nav-label">Pending</span>
+        </button>
+        <button class="nav-btn" data-view="spending-stats">
+          <span class="nav-icon">📊</span>
+          <span class="nav-label">Stats</span>
         </button>
         <button class="nav-btn" data-view="settings">
           <span class="nav-icon">⚙</span>

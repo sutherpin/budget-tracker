@@ -934,15 +934,17 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
   }
   for (const tx of modified) {
     const merchant = tx.merchant_name || tx.name;
+    const occurredAt = tx.datetime || tx.authorized_datetime || tx.date;
     await env.DB.prepare(
       "UPDATE transactions SET amount = ?, merchant = ?, occurred_at = ?, plaid_pending = ? WHERE plaid_transaction_id = ?"
-    ).bind(Math.abs(tx.amount), merchant, tx.date, tx.pending ? 1 : 0, tx.transaction_id).run();
+    ).bind(Math.abs(tx.amount), merchant, occurredAt, tx.pending ? 1 : 0, tx.transaction_id).run();
   }
   for (const tx of added) {
     if (tx.date < PLAID_MIN_SYNC_DATE) continue;
     const merchant = tx.merchant_name || tx.name;
     const amount = tx.amount;
     const transactionType = amount < 0 ? "deposit" : "purchase";
+    const occurredAt = tx.datetime || tx.authorized_datetime || tx.date;
 
     // Plaid links a posted transaction back to the pending one it replaced
     // via pending_transaction_id. When that's present and we already have
@@ -957,13 +959,13 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
       if (priorRow) {
         await env.DB.prepare(
           `UPDATE transactions SET plaid_transaction_id = ?, amount = ?, merchant = ?, occurred_at = ?, transaction_type = ?, plaid_pending = ? WHERE id = ?`
-        ).bind(tx.transaction_id, Math.abs(amount), merchant, tx.date, transactionType, tx.pending ? 1 : 0, priorRow.id).run();
+        ).bind(tx.transaction_id, Math.abs(amount), merchant, occurredAt, transactionType, tx.pending ? 1 : 0, priorRow.id).run();
         console.log(`Linked posted transaction ${tx.transaction_id} to existing row ${priorRow.id} (was pending ${tx.pending_transaction_id})`);
         continue;
       }
     }
 
-    const duplicate = isDuplicateCheckExcluded(merchant) ? null : await findLikelyDuplicate(env, { merchant, amount: Math.abs(amount), occurredAt: tx.date });
+    const duplicate = isDuplicateCheckExcluded(merchant) ? null : await findLikelyDuplicate(env, { merchant, amount: Math.abs(amount), occurredAt });
     const suggestedCategoryId = await suggestCategoryId(env, merchant, merchant);
     const status = suggestedCategoryId ? "categorized" : "pending";
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -977,7 +979,7 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
       merchant,
       null,
       transactionType,
-      tx.date,
+      occurredAt,
       status,
       suggestedCategoryId,
       status === "categorized" ? now : null,
@@ -1523,7 +1525,19 @@ async function handleDashboard(env, url) {
     ...row,
     remaining: row.allotted - row.spent
   }));
-  return jsonResponse({ month, categories: summary });
+
+  const { results: topMerchants } = await env.DB.prepare(
+    `SELECT merchant, SUM(amount) AS total
+    FROM transactions
+    WHERE transaction_type = 'purchase' AND status = 'categorized'
+      AND merchant IS NOT NULL AND merchant != ''
+      AND strftime('%Y-%m', occurred_at) = ?
+    GROUP BY merchant
+    ORDER BY total DESC
+    LIMIT 5`
+  ).bind(month).all();
+
+  return jsonResponse({ month, categories: summary, topMerchants });
 }
 __name(handleDashboard, "handleDashboard");
 function jsonResponse(data, status = 200) {
