@@ -619,6 +619,15 @@ var index_default = {
       if (url.pathname === "/api/plaid/balance/refresh" && request.method === "POST") {
         return await handleRefreshPlaidBalance(request, env);
       }
+      if (url.pathname === "/api/plaid/link-token" && request.method === "POST") {
+        return await handlePlaidCreateLinkToken(env);
+      }
+      if (url.pathname === "/api/plaid/exchange" && request.method === "POST") {
+        return await handlePlaidExchangeToken(request, env);
+      }
+      if (url.pathname === "/api/plaid/items" && request.method === "GET") {
+        return await handlePlaidListItems(env);
+      }
       if (url.pathname === "/api/duplicates" && request.method === "GET") {
         return await handleGetDuplicates(env);
       }
@@ -1156,6 +1165,37 @@ async function handleRefreshPlaidBalance(request, env) {
   return jsonResponse({ success: true, ...result });
 }
 __name(handleRefreshPlaidBalance, "handleRefreshPlaidBalance");
+async function handlePlaidCreateLinkToken(env) {
+  const data = await plaidFetch(env, "/link/token/create", {
+    user: { client_user_id: "budget-tracker-primary-user" },
+    client_name: "Budget Tracker",
+    products: ["transactions"],
+    country_codes: ["US"],
+    language: "en"
+  });
+  return jsonResponse({ link_token: data.link_token });
+}
+__name(handlePlaidCreateLinkToken, "handlePlaidCreateLinkToken");
+async function handlePlaidExchangeToken(request, env) {
+  const body = await request.json();
+  const { public_token, institution_name } = body;
+  if (!public_token) {
+    return jsonResponse({ error: "Missing public_token" }, 400);
+  }
+  const data = await plaidFetch(env, "/item/public_token/exchange", { public_token });
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO plaid_items (item_id, access_token, institution_name) VALUES (?, ?, ?)"
+  ).bind(data.item_id, data.access_token, institution_name || null).run();
+  return jsonResponse({ success: true });
+}
+__name(handlePlaidExchangeToken, "handlePlaidExchangeToken");
+async function handlePlaidListItems(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, institution_name, created_at, updated_at FROM plaid_items ORDER BY created_at ASC"
+  ).all();
+  return jsonResponse({ items: results });
+}
+__name(handlePlaidListItems, "handlePlaidListItems");
 async function handleGetDuplicates(env) {
   const { results } = await env.DB.prepare(
     `SELECT

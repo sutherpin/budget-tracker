@@ -155,6 +155,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('btn-sync-plaid')?.addEventListener('click', syncPlaidNow);
+  document.getElementById('btn-connect-bank')?.addEventListener('click', connectBank);
 
   // Add event listeners for import/export buttons
   document.getElementById('btn-export')?.addEventListener('click', exportDatabase);
@@ -376,6 +377,71 @@ async function syncPlaidNow() {
       btn.disabled = false;
       if (statusEl) statusEl.classList.add('hidden');
     }, 3000);
+  }
+}
+
+async function loadLinkedAccounts() {
+  const listEl = document.getElementById('linked-accounts-list');
+  if (!listEl) return;
+  try {
+    const data = await apiFetch('/api/plaid/items');
+    if (!data.items || data.items.length === 0) {
+      listEl.innerHTML = '<div class="linked-accounts-empty">No banks connected yet</div>';
+      return;
+    }
+    listEl.innerHTML = data.items.map((item) => `
+      <div class="linked-account-row">
+        <span class="linked-account-name">${item.institution_name || 'Unknown institution'}</span>
+        <span class="linked-account-since">Connected ${formatDate(item.created_at)}</span>
+      </div>
+    `).join('');
+  } catch (err) {
+    console.error('Loading linked accounts failed:', err);
+    listEl.innerHTML = '<div class="linked-accounts-empty">Couldn\'t load linked accounts</div>';
+  }
+}
+
+async function connectBank() {
+  const btn = document.getElementById('btn-connect-bank');
+  if (!btn || typeof Plaid === 'undefined') return;
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const { link_token } = await apiFetch('/api/plaid/link-token', { method: 'POST' });
+    const handler = Plaid.create({
+      token: link_token,
+      onSuccess: async (public_token, metadata) => {
+        btn.textContent = 'Connecting…';
+        try {
+          await apiFetch('/api/plaid/exchange', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              public_token,
+              institution_name: metadata?.institution?.name || null
+            })
+          });
+          await loadLinkedAccounts();
+        } catch (err) {
+          console.error('Plaid exchange failed:', err);
+          alert('Connected to Plaid, but saving the account failed. Please try again.');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '+ Connect a bank';
+        }
+      },
+      onExit: (err) => {
+        btn.disabled = false;
+        btn.textContent = '+ Connect a bank';
+        if (err) console.error('Plaid Link exited with error:', err);
+      }
+    });
+    handler.open();
+  } catch (err) {
+    console.error('Creating Plaid link token failed:', err);
+    btn.disabled = false;
+    btn.textContent = '+ Connect a bank';
+    alert('Could not start bank connection. Please try again.');
   }
 }
 
@@ -1367,6 +1433,7 @@ async function switchView(name) {
   if (name === 'settings') {
     renderSettings(state.categories);
     renderRecurringTransactions();
+    loadLinkedAccounts();
   }
   if (name === 'transactions') {
     await loadTransactions();

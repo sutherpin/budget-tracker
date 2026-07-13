@@ -159,7 +159,11 @@
       </div>
 
       <div class="view" id="view-settings">
-        <div class="section-label">Monthly Budgets</div>
+        <div class="section-label">Linked Bank Accounts</div>
+        <div class="linked-accounts-list" id="linked-accounts-list"></div>
+        <button class="btn-connect-bank" id="btn-connect-bank">+ Connect a bank</button>
+
+        <div class="section-label" style="margin-top:2rem">Monthly Budgets</div>
         <div class="settings-list" id="settings-list"></div>
         <button class="btn-save" id="btn-save-budgets">Save Budgets</button>
 
@@ -349,6 +353,7 @@
     </div>
   </div>
 
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

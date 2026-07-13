@@ -1092,6 +1092,54 @@ html, body {
   margin-top: 4px;
 }
 
+.linked-accounts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+}
+.linked-account-row {
+  background: var(--bg2);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-left: 3px solid var(--accent);
+}
+.linked-account-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.linked-account-since {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.linked-accounts-empty {
+  padding: 0 16px 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.btn-connect-bank {
+  margin: 0 16px 8px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px dashed var(--accent);
+  padding: 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  width: calc(100% - 32px);
+}
+.btn-connect-bank:hover {
+  background: var(--bg2);
+}
+.btn-connect-bank:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .recurring-list {
   display: flex;
   flex-direction: column;
