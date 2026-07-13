@@ -58,7 +58,7 @@
 
 .csv-import-description {
   font-size: 0.875rem;
-  color: var(--text-secondary);
+  color: var(--text-dim);
   margin-bottom: 0.5rem;
   line-height: 1.4;
 }
@@ -71,16 +71,17 @@
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
-  background-color: #22c55e;
-  color: white;
+  background-color: var(--accent);
+  color: var(--on-accent);
 }
 
 .btn-csv-import:hover {
-  background-color: #16a34a;
+  opacity: 0.9;
 }
 
 .btn-csv-import:disabled {
-  background-color: #999;
+  background-color: var(--bg3);
+  color: var(--text-dim);
   cursor: not-allowed;
 }
 

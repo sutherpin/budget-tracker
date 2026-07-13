@@ -88,16 +88,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     renderTransactions(filterTransactionsBySearch(loadedTransactions));
   });
 
-  // Add event listener for the new notification button with logging
-  const enableNotificationsButton = document.getElementById('btn-enable-notifications');
-  if (enableNotificationsButton) {
-    console.log('Found "Enable Notifications" button.');
-    enableNotificationsButton.addEventListener('click', registerPush);
-    console.log('Event listener added to "Enable Notifications" button.');
-  } else {
-    console.warn('"Enable Notifications" button not found!');
-  }
-
   // Add event listeners for notes modal buttons
   document.getElementById('btn-cancel-notes')?.addEventListener('click', () => {
     closeNotesModal();
@@ -169,12 +159,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (new URLSearchParams(window.location.search).get('pending')) {
     await loadAll();
     showApp();
-    // Removed automatic registerPush() call
     switchView('pending');
   } else {
     await loadAll();
     showApp();
-    // Removed automatic registerPush() call
   }
 
   if (window.location.href.includes('oauth_state_id=')) {
@@ -1567,55 +1555,6 @@ async function addManualTransaction() {
     console.error('Add manual transaction failed:', err);
     alert('Failed to add transaction');
   }
-}
-
-// ============================================================
-// Web Push subscription registration
-// ============================================================
-async function registerPush() {
-  if (!('PushManager' in window)) {
-    alert('FAIL: PushManager not supported in this browser.');
-    return;
-  }
-  try {
-    alert('Step 1: Getting service worker...');
-    const reg = await navigator.serviceWorker.ready;
-    alert('Step 2: Checking existing subscription...');
-    const existing = await reg.pushManager.getSubscription();
-    if (existing) {
-      alert('Already subscribed! Endpoint: ' + existing.endpoint.slice(0, 50));
-      return;
-    }
-    alert('Step 3: Requesting permission...');
-    const permission = await Notification.requestPermission();
-    alert('Step 4: Permission result = ' + permission);
-    if (permission !== 'granted') {
-      alert('FAIL: Permission denied. Go to Chrome site settings and allow notifications for this site.');
-      return;
-    }
-    alert('Step 5: Subscribing to push...');
-    const sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlB64ToUint8Array(
-        'BMFTguCzw91x3-qNsNiXCPDGebbL_NQem6Rl57YpUXbHedQ0Q_aQZgPlXjFtqZOwfAefcAQtjnAlNmduea5elNM'
-      ),
-    });
-    alert('Step 6: Sending subscription to server...');
-    await apiFetch('/api/push-subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sub),
-    });
-    alert('SUCCESS: Push notifications enabled!');
-  } catch (err) {
-    alert('ERROR at some step: ' + err.message);
-  }
-}
-function urlB64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const rawData = atob(base64);
-  return new Uint8Array([...rawData].map((c) => c.charCodeAt(0)));
 }
 
 // ============================================================
