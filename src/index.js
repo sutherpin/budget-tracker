@@ -482,7 +482,7 @@ async function suggestCategoryId(env, merchant, rawText) {
   return null;
 }
 __name(suggestCategoryId, "suggestCategoryId");
-async function importTransactionsFromCSV(env, csvData, autoResolveDuplicates = true, approvedTransactions = null) {
+async function importTransactionsFromCSV(env, ctx, csvData, autoResolveDuplicates = true, approvedTransactions = null) {
   const lines = csvData.split("\n").filter((line) => line.trim() !== "");
   if (lines.length < 2) {
     return { success: false, error: "CSV file must have at least header and one data row" };
@@ -531,7 +531,7 @@ async function importTransactionsFromCSV(env, csvData, autoResolveDuplicates = t
         suggestedCategoryId = await suggestCategoryId(env, transaction.merchant, transaction.rawData);
       }
       const status = transaction.transactionType === "deposit" || transaction.transactionType === "payment" || suggestedCategoryId ? "categorized" : "pending";
-      await env.DB.prepare(
+      const insertResult = await env.DB.prepare(
         `INSERT INTO transactions
         (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id, categorized_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -546,6 +546,13 @@ async function importTransactionsFromCSV(env, csvData, autoResolveDuplicates = t
         suggestedCategoryId,
         status === "categorized" ? now : null
       ).run();
+      await tryMatchUnclaimedReceipt(env, ctx, {
+        transactionId: insertResult.meta.last_row_id,
+        merchant: transaction.merchant,
+        amount: transaction.amount,
+        occurredAt: transaction.occurredAt,
+        status
+      });
       importedCount++;
     } catch (error) {
       console.error("Error importing transaction:", error);
@@ -713,7 +720,7 @@ var index_default = {
         return await handleImportDatabase(request, env);
       }
       if (url.pathname === "/api/transactions/csv" && request.method === "POST") {
-        return await handleCSVTransactionImport(request, env);
+        return await handleCSVTransactionImport(request, env, ctx);
       }
       if (url.pathname === "/api/test-db" && request.method === "GET") {
         return await handleTestDatabaseConnection(env);
@@ -824,7 +831,14 @@ async function handleIncomingSms(request, env, ctx) {
     status === "categorized" ? now : null
   ).run();
   const transactionId = insertResult.meta.last_row_id;
-  if (status !== "categorized") {
+  const receiptResult = await tryMatchUnclaimedReceipt(env, ctx, {
+    transactionId,
+    merchant: parsed.merchant,
+    amount: parsed.amount,
+    occurredAt: parsed.occurredAt,
+    status
+  });
+  if (!receiptResult && status !== "categorized") {
     ctx.waitUntil(sendPushNotification(env, {
       title: `New charge: ${parsed.merchant || "Unknown"}`,
       body: `$${parsed.amount.toFixed(2)} \u2014 tap to categorize`,
@@ -832,7 +846,7 @@ async function handleIncomingSms(request, env, ctx) {
     }));
     ctx.waitUntil(notifyMacroDroid(env, `New charge: ${parsed.merchant || "Unknown"} \u2014 $${parsed.amount.toFixed(2)}`));
   }
-  return jsonResponse({ success: true, transactionId, parsed, suggestedCategoryId });
+  return jsonResponse({ success: true, transactionId, parsed, suggestedCategoryId, receiptMatched: !!receiptResult });
 }
 __name(handleIncomingSms, "handleIncomingSms");
 var plaidWebhookKeyCache = /* @__PURE__ */ new Map();
@@ -1019,33 +1033,13 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
           "INSERT INTO duplicate_flags (transaction_id, matched_transaction_id) VALUES (?, ?)"
         ).bind(transactionId, duplicate.id).run();
       }
-      // If the receipt for this Walmart charge was already emailed and parsed
-      // before the bank transaction posted, apply that categorization now
-      // instead of treating this as a fresh pending charge — avoids a
-      // redundant "needs categorizing" notification for something already
-      // resolved via the receipt. Only attempt this while the transaction is
-      // still "pending" — if a merchant-map auto-guess already categorized it
-      // above, leave that alone; the next receipt-check cron will notice the
-      // transaction is no longer pending and discard the receipt as moot.
-      let receiptResult = null;
-      const unclaimedReceipt = status === "pending" ? await findMatchingUnclaimedReceipt(env, merchant, Math.abs(amount), occurredAt) : null;
-      if (unclaimedReceipt) {
-        try {
-          const parsedJson = JSON.parse(unclaimedReceipt.parsed_json);
-          receiptResult = await applyReceiptResult(env, transactionId, parsedJson, Math.abs(amount));
-          await env.DB.prepare(
-            "UPDATE processed_receipt_emails SET matched_transaction_id = ?, status = ? WHERE id = ?"
-          ).bind(transactionId, receiptResult.outcome, unclaimedReceipt.id).run();
-          ctx.waitUntil(sendPushNotification(env, {
-            title: receiptResult.outcome === "needs_review" ? `Receipt needs review: ${merchant || "Unknown"}` : `Auto-categorized: ${merchant || "Unknown"}`,
-            body: receiptResult.outcome === "needs_review" ? `$${Math.abs(amount).toFixed(2)} — tap to categorize manually` : `$${Math.abs(amount).toFixed(2)} — ${receiptResult.summary}`,
-            transactionId
-          }));
-        } catch (err) {
-          console.error(`Applying pre-processed receipt to transaction ${transactionId} failed:`, err);
-          receiptResult = null;
-        }
-      }
+      const receiptResult = await tryMatchUnclaimedReceipt(env, ctx, {
+        transactionId,
+        merchant,
+        amount: Math.abs(amount),
+        occurredAt,
+        status
+      });
       if (!receiptResult && status !== "categorized") {
         ctx.waitUntil(sendPushNotification(env, {
           title: `New charge: ${merchant || "Unknown"}`,
@@ -1563,6 +1557,36 @@ ${groupedItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quant
   return { outcome: "matched", summary };
 }
 __name(applyReceiptResult, "applyReceiptResult");
+async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amount, occurredAt, status }) {
+  // If the receipt for this Walmart charge was already emailed and parsed
+  // before the bank transaction posted, apply that categorization now
+  // instead of treating this as a fresh pending charge — avoids a
+  // redundant "needs categorizing" notification for something already
+  // resolved via the receipt. Only attempt this while the transaction is
+  // still "pending" — if a merchant-map auto-guess already categorized it
+  // above, leave that alone; the next receipt-check cron will notice the
+  // transaction is no longer pending and discard the receipt as moot.
+  if (status !== "pending") return null;
+  const unclaimedReceipt = await findMatchingUnclaimedReceipt(env, merchant, amount, occurredAt);
+  if (!unclaimedReceipt) return null;
+  try {
+    const parsedJson = JSON.parse(unclaimedReceipt.parsed_json);
+    const receiptResult = await applyReceiptResult(env, transactionId, parsedJson, amount);
+    await env.DB.prepare(
+      "UPDATE processed_receipt_emails SET matched_transaction_id = ?, status = ? WHERE id = ?"
+    ).bind(transactionId, receiptResult.outcome, unclaimedReceipt.id).run();
+    ctx.waitUntil(sendPushNotification(env, {
+      title: receiptResult.outcome === "needs_review" ? `Receipt needs review: ${merchant || "Unknown"}` : `Auto-categorized: ${merchant || "Unknown"}`,
+      body: receiptResult.outcome === "needs_review" ? `$${amount.toFixed(2)} — tap to categorize manually` : `$${amount.toFixed(2)} — ${receiptResult.summary}`,
+      transactionId
+    }));
+    return receiptResult;
+  } catch (err) {
+    console.error(`Applying pre-processed receipt to transaction ${transactionId} failed:`, err);
+    return null;
+  }
+}
+__name(tryMatchUnclaimedReceipt, "tryMatchUnclaimedReceipt");
 async function notifyGmailAuthFailureIfNeeded(env, ctx) {
   const row = await env.DB.prepare("SELECT last_auth_failure_notified_at FROM receipt_job_runs WHERE id = 1").first();
   const lastNotified = row?.last_auth_failure_notified_at ? new Date(row.last_auth_failure_notified_at) : null;
@@ -2578,7 +2602,7 @@ async function handleDeleteTransaction(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleDeleteTransaction, "handleDeleteTransaction");
-async function handleCSVTransactionImport(request, env) {
+async function handleCSVTransactionImport(request, env, ctx) {
   try {
     const csvData = await request.text();
     if (!csvData || csvData.trim() === "") {
@@ -2586,7 +2610,7 @@ async function handleCSVTransactionImport(request, env) {
     }
     const url = new URL(request.url);
     const scanOnly = url.searchParams.get("scanOnly") === "true";
-    const result = await importTransactionsFromCSV(env, csvData, !scanOnly);
+    const result = await importTransactionsFromCSV(env, ctx, csvData, !scanOnly);
     if (!result.success) {
       return jsonResponse({ error: result.error || "CSV import failed" }, 400);
     }
