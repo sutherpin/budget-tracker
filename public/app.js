@@ -721,7 +721,8 @@ function renderDashboard(data) {
 
   drawPie(data.categories);
   renderBudgetExtremes(data.categories);
-  renderTopMerchants(data.topMerchants || []);
+  renderTopMerchants(data.topMerchants || [], 'pie-chart-merchants', 'pie-tooltip-merchants', 'legend-merchants', 'pie-merchants-total');
+  renderTopMerchants(data.lifetimeTopMerchants || [], 'pie-chart-merchants-lifetime', 'pie-tooltip-merchants-lifetime', 'legend-merchants-lifetime', 'pie-merchants-lifetime-total');
 
   const list = document.getElementById('category-list');
   list.innerHTML = '';
@@ -912,7 +913,7 @@ function renderBudgetExtremes(categories) {
 // Distinct palette from category colors, since merchants have no color of their own.
 const MERCHANT_PALETTE = ['#7c3aed', '#0ea5e9', '#f43f5e', '#f59e0b', '#10b981'];
 
-function renderTopMerchants(topMerchants) {
+function renderTopMerchants(topMerchants, canvasId, tooltipId, legendId, totalId) {
   const merchants = topMerchants.map((m, i) => ({
     name: m.merchant,
     icon: '💸',
@@ -921,11 +922,11 @@ function renderTopMerchants(topMerchants) {
   }));
   const total = merchants.reduce((s, m) => s + m.total, 0);
 
-  drawDonut('pie-chart-merchants', 'pie-tooltip-merchants', merchants.map((m) => ({
+  drawDonut(canvasId, tooltipId, merchants.map((m) => ({
     label: m.name, icon: m.icon, color: m.color, amount: m.total
   })), { outerR: 220, innerR: 144 });
-  renderMiniLegend('legend-merchants', merchants, (m) => m.total, 'No spending yet');
-  animateNumber(document.getElementById('pie-merchants-total'), total);
+  renderMiniLegend(legendId, merchants, (m) => m.total, 'No spending yet');
+  animateNumber(document.getElementById(totalId), total);
 }
 
 function renderMiniLegend(containerId, cats, valueFn, emptyText) {

@@ -2087,18 +2087,37 @@ async function handleDashboard(env, url) {
     remaining: row.allotted - row.spent
   }));
 
+  // Excludes internal self-transfers (e.g. "Withdrawal INTERNET XFR TO SAVGS") —
+  // these move money between the user's own accounts rather than paying an
+  // external merchant, so they'd otherwise dominate/skew this ranking. Matches
+  // on "XFR" specifically (not "TRANSFER") since legitimate third-party
+  // purchases can legitimately contain the word "transfer" (e.g. a PayPal
+  // "INSTANT TRANSFER" purchase) but this bank only abbreviates to "XFR" for
+  // its own internal account-to-account moves.
   const { results: topMerchants } = await env.DB.prepare(
     `SELECT merchant, SUM(amount) AS total
     FROM transactions
     WHERE transaction_type = 'purchase' AND status = 'categorized'
       AND merchant IS NOT NULL AND merchant != ''
+      AND merchant NOT LIKE '%XFR%'
       AND strftime('%Y-%m', occurred_at) = ?
     GROUP BY merchant
     ORDER BY total DESC
     LIMIT 5`
   ).bind(month).all();
 
-  return jsonResponse({ month, categories: summary, topMerchants });
+  const { results: lifetimeTopMerchants } = await env.DB.prepare(
+    `SELECT merchant, SUM(amount) AS total
+    FROM transactions
+    WHERE transaction_type = 'purchase' AND status = 'categorized'
+      AND merchant IS NOT NULL AND merchant != ''
+      AND merchant NOT LIKE '%XFR%'
+    GROUP BY merchant
+    ORDER BY total DESC
+    LIMIT 5`
+  ).all();
+
+  return jsonResponse({ month, categories: summary, topMerchants, lifetimeTopMerchants });
 }
 __name(handleDashboard, "handleDashboard");
 function jsonResponse(data, status = 200) {
