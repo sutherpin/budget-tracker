@@ -59,6 +59,10 @@
         </div>
         <button class="btn-sync-plaid" id="btn-sync-plaid" title="Pull latest transactions from Plaid now">⟳ Sync now</button>
         <div class="sync-status hidden" id="sync-status"></div>
+        <div class="receipt-status-row">
+          <span class="receipt-status-text" id="receipt-status-text"></span>
+          <button class="btn-check-receipts" id="btn-check-receipts" title="Check the receipt inbox now">🧾 Check now</button>
+        </div>
       </div>
 
       <div class="view active" id="view-dashboard">
@@ -90,6 +94,7 @@
       </div>
 
       <div class="view" id="view-pending">
+        <div class="unclaimed-receipts-list hidden" id="unclaimed-receipts-list"></div>
         <div class="section-label">Needs Categorizing</div>
         <div class="pending-list" id="pending-list">
           <div class="empty-state">No pending transactions 🎉</div>

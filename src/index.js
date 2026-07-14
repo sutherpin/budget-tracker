@@ -628,6 +628,15 @@ var index_default = {
       if (url.pathname === "/api/plaid/items" && request.method === "GET") {
         return await handlePlaidListItems(env);
       }
+      if (url.pathname === "/api/receipts/check-now" && request.method === "POST") {
+        return await handleReceiptCheckNow(request, env, ctx);
+      }
+      if (url.pathname === "/api/receipts/sync-now" && request.method === "POST") {
+        return await handleReceiptSyncNow(env, ctx);
+      }
+      if (url.pathname === "/api/receipts/status" && request.method === "GET") {
+        return await handleReceiptStatus(env);
+      }
       if (url.pathname === "/api/duplicates" && request.method === "GET") {
         return await handleGetDuplicates(env);
       }
@@ -743,7 +752,12 @@ var index_default = {
     return response;
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(refreshPlaidBalanceCache(env).catch((err) => console.error("Scheduled balance refresh failed:", err)));
+    if (event.cron === "0 7,19 * * *") {
+      ctx.waitUntil(refreshPlaidBalanceCache(env).catch((err) => console.error("Scheduled balance refresh failed:", err)));
+    }
+    if (event.cron === "*/30 * * * *") {
+      ctx.waitUntil(processWalmartReceipts(env, ctx).catch((err) => console.error("Scheduled receipt check failed:", err)));
+    }
   }
 };
 async function handleIncomingSms(request, env, ctx) {
@@ -1005,7 +1019,34 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
           "INSERT INTO duplicate_flags (transaction_id, matched_transaction_id) VALUES (?, ?)"
         ).bind(transactionId, duplicate.id).run();
       }
-      if (status !== "categorized") {
+      // If the receipt for this Walmart charge was already emailed and parsed
+      // before the bank transaction posted, apply that categorization now
+      // instead of treating this as a fresh pending charge — avoids a
+      // redundant "needs categorizing" notification for something already
+      // resolved via the receipt. Only attempt this while the transaction is
+      // still "pending" — if a merchant-map auto-guess already categorized it
+      // above, leave that alone; the next receipt-check cron will notice the
+      // transaction is no longer pending and discard the receipt as moot.
+      let receiptResult = null;
+      const unclaimedReceipt = status === "pending" ? await findMatchingUnclaimedReceipt(env, merchant, Math.abs(amount), occurredAt) : null;
+      if (unclaimedReceipt) {
+        try {
+          const parsedJson = JSON.parse(unclaimedReceipt.parsed_json);
+          receiptResult = await applyReceiptResult(env, transactionId, parsedJson, Math.abs(amount));
+          await env.DB.prepare(
+            "UPDATE processed_receipt_emails SET matched_transaction_id = ?, status = ? WHERE id = ?"
+          ).bind(transactionId, receiptResult.outcome, unclaimedReceipt.id).run();
+          ctx.waitUntil(sendPushNotification(env, {
+            title: receiptResult.outcome === "needs_review" ? `Receipt needs review: ${merchant || "Unknown"}` : `Auto-categorized: ${merchant || "Unknown"}`,
+            body: receiptResult.outcome === "needs_review" ? `$${Math.abs(amount).toFixed(2)} — tap to categorize manually` : `$${Math.abs(amount).toFixed(2)} — ${receiptResult.summary}`,
+            transactionId
+          }));
+        } catch (err) {
+          console.error(`Applying pre-processed receipt to transaction ${transactionId} failed:`, err);
+          receiptResult = null;
+        }
+      }
+      if (!receiptResult && status !== "categorized") {
         ctx.waitUntil(sendPushNotification(env, {
           title: `New charge: ${merchant || "Unknown"}`,
           body: `$${Math.abs(amount).toFixed(2)} — tap to categorize`,
@@ -1201,6 +1242,430 @@ async function handlePlaidListItems(env) {
   return jsonResponse({ items: results });
 }
 __name(handlePlaidListItems, "handlePlaidListItems");
+async function getGmailAccessToken(env) {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GMAIL_CLIENT_ID,
+      client_secret: env.GMAIL_CLIENT_SECRET,
+      refresh_token: env.GMAIL_REFRESH_TOKEN,
+      grant_type: "refresh_token"
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Gmail token refresh failed (${res.status}):`, data);
+    throw new Error(data.error_description || data.error || "Gmail token refresh failed");
+  }
+  return data.access_token;
+}
+__name(getGmailAccessToken, "getGmailAccessToken");
+async function gmailFetch(accessToken, path) {
+  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me${path}`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Gmail API ${path} failed (${res.status}):`, data);
+    throw new Error(data.error?.message || `Gmail API request to ${path} failed`);
+  }
+  return data;
+}
+__name(gmailFetch, "gmailFetch");
+async function listUnprocessedWalmartReceiptEmails(accessToken) {
+  const data = await gmailFetch(accessToken, `/messages?q=${encodeURIComponent("has:attachment")}`);
+  return (data.messages || []).map((m) => m.id);
+}
+__name(listUnprocessedWalmartReceiptEmails, "listUnprocessedWalmartReceiptEmails");
+async function fetchGmailMessage(accessToken, messageId) {
+  return await gmailFetch(accessToken, `/messages/${messageId}?format=full`);
+}
+__name(fetchGmailMessage, "fetchGmailMessage");
+async function fetchGmailAttachment(accessToken, messageId, attachmentId) {
+  const data = await gmailFetch(accessToken, `/messages/${messageId}/attachments/${attachmentId}`);
+  return base64UrlToBytes(data.data);
+}
+__name(fetchGmailAttachment, "fetchGmailAttachment");
+function bytesToStandardBase64(bytes) {
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+__name(bytesToStandardBase64, "bytesToStandardBase64");
+var RECEIPT_ATTACHMENT_MIME_TYPES = ["image/png", "image/jpeg", "application/pdf"];
+function findReceiptAttachmentPart(payload) {
+  if (!payload) return null;
+  if (RECEIPT_ATTACHMENT_MIME_TYPES.includes(payload.mimeType) && payload.body?.attachmentId) {
+    return { mimeType: payload.mimeType, attachmentId: payload.body.attachmentId, filename: payload.filename };
+  }
+  for (const part of payload.parts || []) {
+    const found = findReceiptAttachmentPart(part);
+    if (found) return found;
+  }
+  return null;
+}
+__name(findReceiptAttachmentPart, "findReceiptAttachmentPart");
+var RECEIPT_SCHEMA = {
+  type: "object",
+  properties: {
+    isReceipt: { type: "boolean", description: "False if this image/document is not actually a store receipt (e.g. an ad, promo banner, or unrelated attachment)" },
+    date: { type: "string", description: "Transaction date converted to strict ISO 8601 (YYYY-MM-DD), regardless of the format printed on the receipt" },
+    subtotal: { type: "number" },
+    taxTotal: { type: "number" },
+    total: { type: "number" },
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          amount: { type: "number" },
+          category: { type: "string" },
+          uncertain: { type: "boolean", description: "True if you are not confident in this item's category (cryptic abbreviation, ambiguous non-merchandise line, etc.)" }
+        },
+        required: ["description", "amount", "category", "uncertain"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["isReceipt", "date", "subtotal", "taxTotal", "total", "items"],
+  additionalProperties: false
+};
+async function parseAndCategorizeReceipt(env, attachmentBytes, mimeType) {
+  const { results: categories } = await env.DB.prepare(
+    "SELECT name FROM categories WHERE is_active = 1"
+  ).all();
+  const categoryNames = categories.map((c) => c.name);
+  const contentBlock = mimeType === "application/pdf"
+    ? { type: "document", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } }
+    : { type: "image", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } };
+  const prompt = `This email attachment is expected to be a photo/scan of a store receipt, but this inbox
+only ever receives forwarded receipts, so occasionally an unrelated ad or promo image slips in.
+First decide: is this actually a receipt? If not, set isReceipt to false and leave the other
+fields as empty/zero placeholders — don't try to force-fit an ad into receipt fields.
+
+If it is a receipt: extract every purchased line item with its description and price, plus the
+subtotal, tax total, and grand total. Convert the date printed on the receipt (whatever format
+it's in, e.g. MM/DD/YY) to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
+lookups, so it must be a real, correctly converted calendar date, not the raw printed string.
+
+Categorize each item into one of these existing budget categories when a reasonable match
+exists: ${categoryNames.join(", ")}.
+If no existing category fits well, choose a short, sensible new category name instead of
+forcing a bad match. If a line item is clearly NOT a purchased product (e.g. a cash-back
+withdrawal, a gift card reload, or another non-merchandise charge), categorize it as "Misc".
+
+Set each item's "uncertain" flag to true whenever you are not genuinely confident in its
+category — cryptic register abbreviations you can't confidently expand, ambiguous
+non-merchandise lines, or anything you're guessing at rather than reading clearly. Set it to
+false only when you're confident. Err toward true rather than force a bad guess.
+
+Respond with structured JSON only, matching the given schema.`;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 4096,
+      thinking: { type: "disabled" },
+      output_config: { format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
+      messages: [
+        { role: "user", content: [contentBlock, { type: "text", text: prompt }] }
+      ]
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Claude receipt parse failed (${res.status}):`, data);
+    throw new Error(data.error?.message || "Claude receipt parse failed");
+  }
+  const textBlock = data.content.find((b) => b.type === "text");
+  if (!textBlock) {
+    throw new Error("Claude response had no text content block");
+  }
+  return JSON.parse(textBlock.text);
+}
+__name(parseAndCategorizeReceipt, "parseAndCategorizeReceipt");
+async function findMatchingWalmartTransaction(env, receiptDate, receiptTotal) {
+  // Only ever touch a transaction still sitting as "pending" — the moment
+  // anything (an auto merchant-map guess or a manual tap) resolves it, the
+  // receipt job must not reach back in and override that decision.
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM transactions
+    WHERE LOWER(merchant) LIKE '%walmart%'
+      AND date(occurred_at) = date(?)
+      AND ABS(amount - ?) <= 0.01
+      AND status = 'pending'`
+  ).bind(receiptDate, receiptTotal).all();
+  if (results.length !== 1) return null;
+  return results[0];
+}
+__name(findMatchingWalmartTransaction, "findMatchingWalmartTransaction");
+async function findAnyMatchingWalmartTransaction(env, receiptDate, receiptTotal) {
+  // Broader existence check (any status) used only to distinguish "no
+  // transaction has arrived yet" from "one arrived and was already resolved
+  // by something else" — the latter means the receipt is now moot.
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM transactions
+    WHERE LOWER(merchant) LIKE '%walmart%'
+      AND date(occurred_at) = date(?)
+      AND ABS(amount - ?) <= 0.01`
+  ).bind(receiptDate, receiptTotal).all();
+  if (results.length !== 1) return null;
+  return results[0];
+}
+__name(findAnyMatchingWalmartTransaction, "findAnyMatchingWalmartTransaction");
+async function findMatchingUnclaimedReceipt(env, merchant, amount, occurredAt) {
+  if (!/walmart/i.test(merchant || "")) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM processed_receipt_emails
+    WHERE status = 'no_transaction_match'
+      AND matched_transaction_id IS NULL
+      AND date(receipt_date) = date(?)
+      AND ABS(receipt_total - ?) <= 0.01`
+  ).bind(occurredAt, amount).all();
+  if (results.length !== 1) return null;
+  return results[0];
+}
+__name(findMatchingUnclaimedReceipt, "findMatchingUnclaimedReceipt");
+async function recordProcessedReceiptEmail(env, { messageId, status, receiptTotal, receiptDate, parsedJson, matchedTransactionId, detail }) {
+  await env.DB.prepare(
+    `INSERT INTO processed_receipt_emails
+    (gmail_message_id, receipt_total, receipt_date, parsed_json, matched_transaction_id, status, detail)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(gmail_message_id) DO UPDATE SET
+      receipt_total = excluded.receipt_total,
+      receipt_date = excluded.receipt_date,
+      parsed_json = excluded.parsed_json,
+      matched_transaction_id = excluded.matched_transaction_id,
+      status = excluded.status,
+      detail = excluded.detail`
+  ).bind(
+    messageId,
+    receiptTotal ?? null,
+    receiptDate ?? null,
+    parsedJson ? JSON.stringify(parsedJson) : null,
+    matchedTransactionId ?? null,
+    status,
+    detail ?? null
+  ).run();
+}
+__name(recordProcessedReceiptEmail, "recordProcessedReceiptEmail");
+async function flagTransactionNeedsReceiptReview(env, transactionId, parsed) {
+  const uncertainItems = parsed.items.filter((i) => i.uncertain);
+  const confidentItems = parsed.items.filter((i) => !i.uncertain);
+  const lines = [
+    "⚠️ Auto-flagged by receipt scan — needs manual categorization:",
+    ...uncertainItems.map((i) => `  • ${i.description} — $${i.amount.toFixed(2)} (uncertain: guessed "${i.category}")`)
+  ];
+  if (confidentItems.length) {
+    lines.push("Other items on this receipt (already looked confident):");
+    lines.push(...confidentItems.map((i) => `  • ${i.description} — $${i.amount.toFixed(2)} → ${i.category}`));
+  }
+  const autoNote = lines.join("\n");
+  const existing = await env.DB.prepare("SELECT notes FROM transaction_notes WHERE transaction_id = ?").bind(transactionId).first();
+  const combinedNotes = existing?.notes ? `${autoNote}
+
+---
+${existing.notes}` : autoNote;
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO transaction_notes (transaction_id, notes, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(transaction_id) DO UPDATE SET notes = excluded.notes, updated_at = excluded.updated_at`
+  ).bind(transactionId, combinedNotes, now).run();
+  await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+  await env.DB.prepare(
+    "UPDATE transactions SET is_split = 0, category_id = NULL, status = 'needs_review', categorized_at = NULL WHERE id = ?"
+  ).bind(transactionId).run();
+  return uncertainItems.map((i) => i.description).join(", ");
+}
+__name(flagTransactionNeedsReceiptReview, "flagTransactionNeedsReceiptReview");
+async function applyReceiptResult(env, transactionId, parsed, transactionAmount) {
+  if (parsed.items.some((i) => i.uncertain)) {
+    const uncertainSummary = await flagTransactionNeedsReceiptReview(env, transactionId, parsed);
+    return { outcome: "needs_review", summary: `Needs review: ${uncertainSummary}` };
+  }
+  const labelToId = /* @__PURE__ */ new Map();
+  const groupTotals = /* @__PURE__ */ new Map();
+  for (const item of parsed.items) {
+    let categoryId = labelToId.get(item.category);
+    if (categoryId === void 0) {
+      categoryId = await resolveCategoryIdByLabel(env, item.category);
+      labelToId.set(item.category, categoryId);
+    }
+    groupTotals.set(categoryId, (groupTotals.get(categoryId) || 0) + item.amount);
+  }
+  const entries = [...groupTotals.entries()].map(([categoryId, groupSubtotal]) => {
+    const taxShare = parsed.subtotal > 0 ? parsed.taxTotal * (groupSubtotal / parsed.subtotal) : 0;
+    return { categoryId, amount: Math.round((groupSubtotal + taxShare) * 100) / 100 };
+  });
+  const sum = entries.reduce((s, e) => s + e.amount, 0);
+  const drift = Math.round((transactionAmount - sum) * 100) / 100;
+  if (drift !== 0 && entries.length > 0) {
+    const largest = entries.reduce((a, b) => (b.amount > a.amount ? b : a));
+    largest.amount = Math.round((largest.amount + drift) * 100) / 100;
+  }
+  const finalSum = entries.reduce((s, e) => s + e.amount, 0);
+  if (Math.abs(finalSum - transactionAmount) > 0.01) {
+    throw new Error(`Split sum ${finalSum.toFixed(2)} doesn't match transaction amount ${transactionAmount.toFixed(2)}`);
+  }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+  if (entries.length === 1) {
+    await env.DB.prepare(
+      "UPDATE transactions SET is_split = 0, category_id = ?, status = 'categorized', categorized_at = ? WHERE id = ?"
+    ).bind(entries[0].categoryId, now, transactionId).run();
+  } else {
+    for (const e of entries) {
+      await env.DB.prepare(
+        "INSERT INTO transaction_splits (transaction_id, category_id, amount) VALUES (?, ?, ?)"
+      ).bind(transactionId, e.categoryId, e.amount).run();
+    }
+    await env.DB.prepare(
+      "UPDATE transactions SET is_split = 1, category_id = NULL, status = 'categorized', categorized_at = ? WHERE id = ?"
+    ).bind(now, transactionId).run();
+  }
+  const { results: allCats } = await env.DB.prepare("SELECT id, name FROM categories").all();
+  const nameById = new Map(allCats.map((c) => [c.id, c.name]));
+  const summary = entries.map((e) => `${nameById.get(e.categoryId) || "Unknown"} $${e.amount.toFixed(2)}`).join(", ");
+  return { outcome: "matched", summary };
+}
+__name(applyReceiptResult, "applyReceiptResult");
+async function processWalmartReceipts(env, ctx) {
+  const accessToken = await getGmailAccessToken(env);
+  const candidateIds = await listUnprocessedWalmartReceiptEmails(accessToken);
+  const { results: alreadyProcessed } = await env.DB.prepare(
+    "SELECT gmail_message_id FROM processed_receipt_emails"
+  ).all();
+  const seen = new Set(alreadyProcessed.map((r) => r.gmail_message_id));
+  const messageIds = candidateIds.filter((id) => !seen.has(id));
+  const summary = [];
+  for (const messageId of messageIds) {
+    try {
+      const message = await fetchGmailMessage(accessToken, messageId);
+      const part = findReceiptAttachmentPart(message.payload);
+      if (!part) {
+        await recordProcessedReceiptEmail(env, { messageId, status: "no_attachment" });
+        summary.push({ messageId, status: "no_attachment" });
+        continue;
+      }
+      const bytes = await fetchGmailAttachment(accessToken, messageId, part.attachmentId);
+      const parsed = await parseAndCategorizeReceipt(env, bytes, part.mimeType);
+      if (!parsed.isReceipt) {
+        await recordProcessedReceiptEmail(env, { messageId, status: "not_a_receipt" });
+        summary.push({ messageId, status: "not_a_receipt" });
+        continue;
+      }
+      const itemSum = parsed.items.reduce((s, i) => s + i.amount, 0);
+      if (Math.abs(itemSum - parsed.subtotal) > 0.01) {
+        await recordProcessedReceiptEmail(env, {
+          messageId,
+          status: "parse_error",
+          receiptTotal: parsed.total,
+          receiptDate: parsed.date,
+          parsedJson: parsed,
+          detail: `Item sum ${itemSum.toFixed(2)} didn't match subtotal ${parsed.subtotal.toFixed(2)}`
+        });
+        summary.push({ messageId, status: "parse_error" });
+        continue;
+      }
+      const txn = await findMatchingWalmartTransaction(env, parsed.date, parsed.total);
+      if (!txn) {
+        // No still-pending transaction to attach to. Distinguish "one exists
+        // but was already resolved by something else in the meantime" (the
+        // receipt is now moot — discard it) from "nothing has arrived yet"
+        // (keep parsed_json around so a later Plaid sync can claim it).
+        const alreadyResolved = await findAnyMatchingWalmartTransaction(env, parsed.date, parsed.total);
+        if (alreadyResolved) {
+          await recordProcessedReceiptEmail(env, {
+            messageId,
+            status: "already_complete",
+            receiptTotal: parsed.total,
+            receiptDate: parsed.date,
+            matchedTransactionId: alreadyResolved.id,
+            detail: "Matching transaction was already categorized before this receipt was processed — discarded."
+          });
+          summary.push({ messageId, status: "already_complete", transactionId: alreadyResolved.id });
+          continue;
+        }
+        await recordProcessedReceiptEmail(env, {
+          messageId,
+          status: "no_transaction_match",
+          receiptTotal: parsed.total,
+          receiptDate: parsed.date,
+          parsedJson: parsed
+        });
+        summary.push({ messageId, status: "no_transaction_match" });
+        continue;
+      }
+      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount);
+      await recordProcessedReceiptEmail(env, {
+        messageId,
+        status: result.outcome,
+        receiptTotal: parsed.total,
+        receiptDate: parsed.date,
+        parsedJson: parsed,
+        matchedTransactionId: txn.id,
+        detail: result.summary
+      });
+      summary.push({ messageId, status: result.outcome, transactionId: txn.id });
+      ctx.waitUntil(sendPushNotification(env, {
+        title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || "Walmart"}` : `Auto-categorized: ${txn.merchant || "Walmart"}`,
+        body: result.outcome === "needs_review" ? `$${txn.amount.toFixed(2)} — tap to categorize manually` : `$${txn.amount.toFixed(2)} — ${result.summary}`,
+        transactionId: txn.id
+      }));
+    } catch (err) {
+      console.error(`Receipt processing failed for message ${messageId}:`, err);
+      await recordProcessedReceiptEmail(env, { messageId, status: "parse_error", detail: err.message });
+      summary.push({ messageId, status: "error", error: err.message });
+    }
+  }
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO receipt_job_runs (id, last_run_at, last_run_count) VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at, last_run_count = excluded.last_run_count`
+  ).bind(now, summary.length).run();
+  return { count: summary.length, results: summary };
+}
+__name(processWalmartReceipts, "processWalmartReceipts");
+async function handleReceiptCheckNow(request, env, ctx) {
+  const providedSecret = request.headers.get("X-Budget-Secret");
+  if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+  const result = await processWalmartReceipts(env, ctx);
+  return jsonResponse({ success: true, ...result });
+}
+async function handleReceiptSyncNow(env, ctx) {
+  const result = await processWalmartReceipts(env, ctx);
+  return jsonResponse({ success: true, ...result });
+}
+__name(handleReceiptSyncNow, "handleReceiptSyncNow");
+async function handleReceiptStatus(env) {
+  const runRow = await env.DB.prepare(
+    "SELECT last_run_at, last_run_count FROM receipt_job_runs WHERE id = 1"
+  ).first();
+  const { results: unclaimed } = await env.DB.prepare(
+    `SELECT id, receipt_total, receipt_date, processed_at FROM processed_receipt_emails
+    WHERE status = 'no_transaction_match' ORDER BY processed_at DESC`
+  ).all();
+  return jsonResponse({
+    lastRunAt: runRow?.last_run_at || null,
+    lastRunCount: runRow?.last_run_count ?? null,
+    unclaimedReceipts: unclaimed
+  });
+}
+__name(handleReceiptStatus, "handleReceiptStatus");
+__name(handleReceiptCheckNow, "handleReceiptCheckNow");
 async function handleGetDuplicates(env) {
   const { results } = await env.DB.prepare(
     `SELECT

@@ -1,5 +1,13 @@
 const API = location.origin;
 
+// Pending Walmart charges get auto-categorized from a matched receipt within
+// ~30 min (see the receipt-check cron) — flag them so the user doesn't jump
+// in and categorize manually while that's still in flight.
+function awaitingReceiptBadgeHtml(txn) {
+  if (txn.status !== 'pending' || !/walmart/i.test(txn.merchant || '')) return '';
+  return ' <span class="awaiting-receipt-badge">awaiting receipt</span>';
+}
+
 let state = {
   categories: [],
   dashboard: { month: '', categories: [] },
@@ -146,6 +154,8 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('btn-sync-plaid')?.addEventListener('click', syncPlaidNow);
   document.getElementById('btn-connect-bank')?.addEventListener('click', connectBank);
+  document.getElementById('btn-check-receipts')?.addEventListener('click', checkReceiptsNow);
+  setInterval(loadReceiptStatus, 60000);
 
   // Add event listeners for import/export buttons
   document.getElementById('btn-export')?.addEventListener('click', exportDatabase);
@@ -191,6 +201,7 @@ async function loadAll() {
     { label: 'Recurring transactions', fn: loadRecurringTransactions },
     { label: 'Account balance', fn: loadBalance },
     { label: 'Duplicate check', fn: loadDuplicates },
+    { label: 'Receipt status', fn: loadReceiptStatus },
   ];
   const completedLabels = new Set();
   setLoadingStatus(`Loading ${steps.map((s) => s.label).join(', ')}…`, 5);
@@ -369,6 +380,71 @@ async function syncPlaidNow() {
       btn.textContent = '⟳ Sync now';
       btn.disabled = false;
       if (statusEl) statusEl.classList.add('hidden');
+    }, 3000);
+  }
+}
+
+const RECEIPT_CHECK_INTERVAL_MINUTES = 30;
+
+function renderReceiptStatusText(data) {
+  const textEl = document.getElementById('receipt-status-text');
+  if (!textEl) return;
+  if (!data.lastRunAt) {
+    textEl.textContent = 'Receipt inbox not checked yet';
+    return;
+  }
+  const lastRun = new Date(data.lastRunAt.includes('T') ? data.lastRunAt : data.lastRunAt.replace(' ', 'T') + 'Z');
+  const minutesSince = Math.floor((Date.now() - lastRun.getTime()) / 60000);
+  const minutesLeft = Math.max(0, RECEIPT_CHECK_INTERVAL_MINUTES - minutesSince);
+  const foundText = data.lastRunCount ? ` (found ${data.lastRunCount})` : '';
+  const nextText = minutesLeft > 0 ? `next check in ~${minutesLeft}m` : 'checking again soon';
+  textEl.textContent = `🧾 Checked ${formatRelativeTime(data.lastRunAt)}${foundText} · ${nextText}`;
+}
+
+function renderUnclaimedReceipts(receipts) {
+  const listEl = document.getElementById('unclaimed-receipts-list');
+  if (!listEl) return;
+  if (!receipts || !receipts.length) {
+    listEl.classList.add('hidden');
+    listEl.innerHTML = '';
+    return;
+  }
+  listEl.classList.remove('hidden');
+  listEl.innerHTML = receipts.map((r) => `
+    <div class="unclaimed-receipt-row">
+      <span class="unclaimed-receipt-icon">🧾</span>
+      <span class="unclaimed-receipt-text">Receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — waiting for the bank to report this transaction</span>
+    </div>
+  `).join('');
+}
+
+async function loadReceiptStatus() {
+  try {
+    const data = await apiFetch('/api/receipts/status');
+    renderReceiptStatusText(data);
+    renderUnclaimedReceipts(data.unclaimedReceipts);
+  } catch (err) {
+    console.error('Loading receipt status failed:', err);
+  }
+}
+
+async function checkReceiptsNow() {
+  const btn = document.getElementById('btn-check-receipts');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  try {
+    const data = await apiFetch('/api/receipts/sync-now', { method: 'POST' });
+    btn.textContent = data.count > 0 ? `✓ ${data.count} processed` : '✓ Nothing new';
+    await loadReceiptStatus();
+    await loadPending();
+  } catch (err) {
+    console.error('Receipt check failed:', err);
+    btn.textContent = '✗ Check failed';
+  } finally {
+    setTimeout(() => {
+      btn.textContent = '🧾 Check now';
+      btn.disabled = false;
     }, 3000);
   }
 }
@@ -912,7 +988,7 @@ function renderCategoryDetailList(transactions) {
     item.className = 'transaction-item';
     item.innerHTML = `
       <div class="transaction-info">
-        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
+        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
         ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
       </div>
@@ -996,7 +1072,7 @@ function renderPending(transactions) {
     card.className = 'pending-card';
     card.innerHTML = `
       <div class="pending-info">
-        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
+        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="pending-date">${formatDate(txn.occurred_at)}</div>
       </div>
       <div class="pending-amount">${fmt(txn.amount)}</div>
@@ -1607,7 +1683,7 @@ function renderTransactions(transactions) {
       item.className = 'transaction-item';
       item.innerHTML = `
         <div class="transaction-info">
-          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}</div>
+          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
           <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
           ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
         </div>

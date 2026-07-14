@@ -1,0 +1,14 @@
+{
+  "name": "gmail-oauth-setup",
+  "private": true,
+  "version": "1.0.0",
+  "description": "One-off local script to authorize sutherwebreceipts@gmail.com and capture a Gmail API refresh token for the budget-tracker Worker.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

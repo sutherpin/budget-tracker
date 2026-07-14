@@ -12,6 +12,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["plaid-test/server.js"],
       "port": 3000
+    },
+    {
+      "name": "gmail-oauth-setup",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["gmail-oauth-setup/server.js"],
+      "port": 3001
     }
   ]
 }

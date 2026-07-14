@@ -19,7 +19,10 @@
   // (UTC-7). During PST (UTC-8, winter) this will run at 11pm/11am local
   // instead of exact midnight/noon; adjust to "0 8,20 * * *" if that drift
   // matters.
+  //
+  // The second entry checks the receipt inbox every 30 minutes, all day, and
+  // auto-categorizes matching Walmart transactions from parsed receipts.
   "triggers": {
-    "crons": ["0 7,19 * * *"]
+    "crons": ["0 7,19 * * *", "*/30 * * * *"]
   }
 }

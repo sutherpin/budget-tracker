@@ -352,6 +352,34 @@ html, body {
   color: var(--text-dim);
   font-style: italic;
 }
+.receipt-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+.receipt-status-text {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.btn-check-receipts {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--bg3);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.btn-check-receipts:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.btn-check-receipts:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 .account-balance-item {
   display: flex;
   align-items: baseline;
@@ -660,6 +688,29 @@ html, body {
   font-weight: 500;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+.unclaimed-receipts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+.unclaimed-receipt-row {
+  background: var(--bg2);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-left: 3px dashed var(--text-dim);
+}
+.unclaimed-receipt-icon {
+  font-size: 16px;
+}
+.unclaimed-receipt-text {
+  font-size: 13px;
+  color: var(--text-dim);
 }
 
 .pending-list {
@@ -1359,6 +1410,34 @@ html, body {
   letter-spacing: 0.04em;
   color: #f59e0b;
   border: 1px solid #f59e0b;
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.needs-review-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.awaiting-receipt-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  border: 1px dashed var(--text-dim);
   border-radius: 4px;
   padding: 1px 5px;
   margin-left: 6px;
