@@ -322,6 +322,39 @@ function toPkcs8(rawKey) {
 __name(toPkcs8, "toPkcs8");
 
 // src/csv-parser.js
+function splitCsvIntoRecords(csvData) {
+  // Splitting on raw "\n" isn't CSV-spec-safe: a quoted field can legally
+  // contain a literal newline (banks do this for "Processing... <merchant>
+  // (Pending)" rows), which would otherwise tear one logical row into two
+  // garbled half-rows that silently fail to parse. Walk the text tracking
+  // quote state so an embedded newline inside quotes doesn't end the record.
+  const records = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < csvData.length; i++) {
+    const char = csvData[i];
+    if (char === '"') {
+      if (inQuotes && csvData[i + 1] === '"') {
+        current += '""';
+        i++;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      current += char;
+      continue;
+    }
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && csvData[i + 1] === "\n") i++;
+      if (current.trim() !== "") records.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim() !== "") records.push(current);
+  return records;
+}
+__name(splitCsvIntoRecords, "splitCsvIntoRecords");
 function parseCSVLine(line) {
   const values = [];
   let currentValue = "";
@@ -355,7 +388,15 @@ function parseTransactionFromCSV(row) {
   if (row.length < 6) {
     return null;
   }
-  const [dateStr, description, , , amountStr] = row;
+  const [dateStr, rawDescription, , , amountStr] = row;
+  // Pending/processing rows render as "Processing...\n <merchant> (Pending)"
+  // (a real embedded newline within the quoted CSV field) — collapse that
+  // down to a clean merchant string instead of importing the literal noise.
+  const description = rawDescription
+    .replace(/^\s*Processing\.\.\.\s*/i, "")
+    .replace(/\s*\(Pending\)\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const dateParts = dateStr.split("/");
   if (dateParts.length !== 3) {
     return null;
@@ -402,21 +443,52 @@ async function findPotentialDuplicate(env, transaction) {
     transaction.occurredAt
   ).first();
   if (exactMatch) {
-    return exactMatch;
+    // Same merchant string, same amount, same day — zero ambiguity. Callers
+    // use this tier to auto-skip without bothering the user for a decision.
+    return { ...exactMatch, matchType: "exact" };
   }
+  // Recognized merchant families (Walmart/Amazon) can show up under totally
+  // different raw descriptors depending on feed (Plaid's clean "Walmart" vs
+  // a raw CSV terminal string like "POS WM SUPERCENTER #3380...") — the
+  // substring-overlap check below can never bridge that, so check family
+  // membership + amount + nearby date explicitly first.
+  const family = Object.entries(RECEIPT_SOURCES).find(([, cfg]) => cfg.merchantRegex.test(transaction.merchant || ""))?.[0];
+  if (family) {
+    const { sql, patterns } = merchantLikeClause(family);
+    const familyMatch = await env.DB.prepare(
+      `SELECT id, merchant, amount, occurred_at FROM transactions
+      WHERE ${sql}
+        AND amount = ?
+        AND ABS(julianday(date(occurred_at)) - julianday(date(?))) <= ?`
+    ).bind(...patterns, transaction.amount, transaction.occurredAt, RECEIPT_DATE_MATCH_TOLERANCE_DAYS).first();
+    // Not "exact" — same family + amount doesn't rule out two separate
+    // purchases of the same price within the tolerance window, so this
+    // still goes through manual review rather than being auto-skipped.
+    if (familyMatch) return { ...familyMatch, matchType: "family" };
+  }
+  // Generic fallback for any merchant not covered by a RECEIPT_SOURCES family
+  // (e.g. "Target" from Plaid/SMS vs a raw CSV descriptor like "POS TARGET
+  // T-2314 2941 QueeRichland WAUS"). The old approach only ever slid an
+  // 8-char window across the DB-stored merchant and required it to be at
+  // least 8 characters — both assumptions fail whenever the *shorter* name
+  // is the one already stored (e.g. a clean 6-character "Target"), which
+  // silently excluded every short merchant name from duplicate detection.
+  // Instead: whichever of the two strings is shorter, check if it appears
+  // as a substring of the longer one (either direction).
   const partialMatches = await env.DB.prepare(
     `SELECT id, merchant, amount, occurred_at FROM transactions
     WHERE amount = ?
-    AND LENGTH(merchant) >= 8`
+    AND LENGTH(merchant) >= 4`
   ).bind(transaction.amount).all();
   for (const potentialMatch of partialMatches.results) {
-    const matchMerchant = potentialMatch.merchant.toLowerCase();
-    const newMerchant = transaction.merchant.toLowerCase();
-    for (let i = 0; i <= matchMerchant.length - 8; i++) {
-      const substring = matchMerchant.substring(i, i + 8);
-      if (newMerchant.includes(substring)) {
-        return potentialMatch;
-      }
+    const matchMerchant = (potentialMatch.merchant || "").toLowerCase();
+    const newMerchant = (transaction.merchant || "").toLowerCase();
+    if (matchMerchant.length < 4 || newMerchant.length < 4) continue;
+    const [shorter, longer] = matchMerchant.length <= newMerchant.length
+      ? [matchMerchant, newMerchant]
+      : [newMerchant, matchMerchant];
+    if (longer.includes(shorter)) {
+      return { ...potentialMatch, matchType: "partial" };
     }
   }
   return null;
@@ -470,30 +542,101 @@ async function resolveCategoryIdByLabel(env, label) {
   return insert.meta.last_row_id;
 }
 __name(resolveCategoryIdByLabel, "resolveCategoryIdByLabel");
+var MANUAL_ONLY_MERCHANT_PATTERNS = [
+  // Costco has no receipt-parsing pipeline yet (unlike Walmart/Amazon) — for
+  // now these just need to stay uncategorized/pending so the user always
+  // categorizes them by hand instead of getting a wrong auto-guess.
+  /costco/i
+];
 async function suggestCategoryId(env, merchant, rawText) {
+  // Walmart/Amazon are categorized exclusively via the receipt-matching
+  // pipeline (findMatchingTransaction / tryMatchUnclaimedReceipt), which only
+  // ever touches a transaction while it's still status = 'pending'. Letting a
+  // merchant-map guess categorize these here would flip status to
+  // 'categorized' at insert time and permanently lock the receipt job out —
+  // and since merchant_category_map is keyed on the raw merchant string with
+  // no per-order distinction, one manual "Entertainment" tap on a digital
+  // Amazon charge would silently mis-categorize every future Amazon order.
+  if (merchant && (
+    Object.values(RECEIPT_SOURCES).some((source) => source.merchantRegex.test(merchant)) ||
+    MANUAL_ONLY_MERCHANT_PATTERNS.some((pattern) => pattern.test(merchant))
+  )) {
+    return { categoryId: null, method: null };
+  }
   if (merchant) {
     const suggestion = await env.DB.prepare(
       "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
     ).bind(merchant).first();
-    if (suggestion) return suggestion.category_id;
+    if (suggestion) return { categoryId: suggestion.category_id, method: "merchant_map" };
   }
   const autoLabel = matchAutoCategoryLabel(merchant, rawText);
-  if (autoLabel) return await resolveCategoryIdByLabel(env, autoLabel);
-  return null;
+  if (autoLabel) return { categoryId: await resolveCategoryIdByLabel(env, autoLabel), method: "auto_label", detail: autoLabel };
+  return { categoryId: null, method: null };
 }
 __name(suggestCategoryId, "suggestCategoryId");
-async function importTransactionsFromCSV(env, ctx, csvData, autoResolveDuplicates = true, approvedTransactions = null) {
-  const lines = csvData.split("\n").filter((line) => line.trim() !== "");
+async function recordAutoCategorization(env, { transactionId, merchant, amount, categoryId, method, source, detail }) {
+  await env.DB.prepare(
+    `INSERT INTO auto_categorization_log (transaction_id, merchant, amount, category_id, method, source, detail)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).bind(transactionId, merchant ?? null, amount ?? null, categoryId ?? null, method, source ?? null, detail ?? null).run();
+}
+__name(recordAutoCategorization, "recordAutoCategorization");
+async function insertCsvTransaction(env, ctx, transaction) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  let suggestedCategoryId = null;
+  let suggestionMethod = null;
+  let suggestionDetail = null;
+  if (transaction.transactionType === "purchase") {
+    ({ categoryId: suggestedCategoryId, method: suggestionMethod, detail: suggestionDetail } = await suggestCategoryId(env, transaction.merchant, transaction.rawData));
+  }
+  const status = transaction.transactionType === "deposit" || transaction.transactionType === "payment" || suggestedCategoryId ? "categorized" : "pending";
+  const insertResult = await env.DB.prepare(
+    `INSERT INTO transactions
+    (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id, categorized_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    `CSV:${transaction.rawData}`,
+    transaction.amount,
+    transaction.merchant,
+    null,
+    transaction.transactionType,
+    transaction.occurredAt,
+    status,
+    suggestedCategoryId,
+    status === "categorized" ? now : null
+  ).run();
+  const transactionId = insertResult.meta.last_row_id;
+  if (suggestedCategoryId) {
+    await recordAutoCategorization(env, {
+      transactionId,
+      merchant: transaction.merchant,
+      amount: transaction.amount,
+      categoryId: suggestedCategoryId,
+      method: suggestionMethod,
+      detail: suggestionDetail
+    });
+  }
+  await tryMatchUnclaimedReceipt(env, ctx, {
+    transactionId,
+    merchant: transaction.merchant,
+    amount: transaction.amount,
+    occurredAt: transaction.occurredAt,
+    status
+  });
+  return transactionId;
+}
+__name(insertCsvTransaction, "insertCsvTransaction");
+async function importTransactionsFromCSV(env, ctx, csvData) {
+  const lines = splitCsvIntoRecords(csvData);
   if (lines.length < 2) {
     return { success: false, error: "CSV file must have at least header and one data row" };
   }
   const transactionLines = lines.slice(1);
   let importedCount = 0;
-  let duplicateCount = 0;
+  let autoSkippedCount = 0;
+  let queuedForReviewCount = 0;
   let skippedCount = 0;
   let errorCount = 0;
-  const potentialDuplicates = [];
-  const approvedTransactionIds = new Set(approvedTransactions?.map((t) => t.rawData) || []);
   for (const line of transactionLines) {
     try {
       if (!line.trim()) continue;
@@ -509,85 +652,62 @@ async function importTransactionsFromCSV(env, ctx, csvData, autoResolveDuplicate
       }
       const potentialDuplicate = await findPotentialDuplicate(env, transaction);
       if (potentialDuplicate) {
-        if (autoResolveDuplicates) {
-          duplicateCount++;
-          continue;
-        } else {
-          potentialDuplicates.push({
-            transaction,
-            existingTransaction: potentialDuplicate
-          });
+        if (potentialDuplicate.matchType === "exact") {
+          // Same merchant string + amount + day as an existing transaction —
+          // no realistic ambiguity, so skip it without bothering the user.
+          autoSkippedCount++;
           continue;
         }
+        // Fuzzy match (merchant-family or partial-substring) — these can be
+        // false positives (e.g. two separate same-price Walmart trips), so
+        // queue it for review instead of guessing either way. Never silently
+        // drop it: both the manual "Import CSV" button and the unattended
+        // watch_downloads.py watcher behave identically here — import
+        // everything unambiguous right away, and let the user Skip/Import
+        // each flagged row later regardless of which path triggered it.
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO csv_import_duplicates
+          (raw_data, merchant, amount, occurred_at, transaction_type, existing_transaction_id, status)
+          VALUES (?, ?, ?, ?, ?, ?, 'pending_review')`
+        ).bind(
+          transaction.rawData,
+          transaction.merchant,
+          transaction.amount,
+          transaction.occurredAt,
+          transaction.transactionType,
+          potentialDuplicate.id
+        ).run();
+        queuedForReviewCount++;
+        continue;
       }
-      if (!autoResolveDuplicates && approvedTransactions && approvedTransactions.length > 0) {
-        if (!approvedTransactionIds.has(transaction.rawData)) {
-          continue;
-        }
-      }
-      const now = (/* @__PURE__ */ new Date()).toISOString();
-      let suggestedCategoryId = null;
-      if (transaction.transactionType === "purchase") {
-        suggestedCategoryId = await suggestCategoryId(env, transaction.merchant, transaction.rawData);
-      }
-      const status = transaction.transactionType === "deposit" || transaction.transactionType === "payment" || suggestedCategoryId ? "categorized" : "pending";
-      const insertResult = await env.DB.prepare(
-        `INSERT INTO transactions
-        (raw_sms, amount, merchant, card_last4, transaction_type, occurred_at, status, category_id, categorized_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        `CSV:${transaction.rawData}`,
-        transaction.amount,
-        transaction.merchant,
-        null,
-        transaction.transactionType,
-        transaction.occurredAt,
-        status,
-        suggestedCategoryId,
-        status === "categorized" ? now : null
-      ).run();
-      await tryMatchUnclaimedReceipt(env, ctx, {
-        transactionId: insertResult.meta.last_row_id,
-        merchant: transaction.merchant,
-        amount: transaction.amount,
-        occurredAt: transaction.occurredAt,
-        status
-      });
+      await insertCsvTransaction(env, ctx, transaction);
       importedCount++;
     } catch (error) {
       console.error("Error importing transaction:", error);
       errorCount++;
     }
   }
-  if (autoResolveDuplicates) {
-    const totalTransactions = importedCount + duplicateCount + skippedCount;
-    return {
-      success: true,
-      importedCount,
-      duplicateCount,
-      skippedCount,
-      totalTransactions,
-      // Add total transactions count
-      errorCount,
-      potentialDuplicates: [],
-      message: `Import completed: ${importedCount} imported, ${duplicateCount} duplicates, ${skippedCount} not current month, ${errorCount} errors`
-    };
-  } else {
-    const totalTransactions = transactionLines.length - errorCount;
-    return {
-      success: true,
-      importedCount: 0,
-      // No imports during scan
-      duplicateCount: 0,
-      // Don't count duplicates yet
-      skippedCount,
-      totalTransactions,
-      // Add total transactions count
-      errorCount,
-      potentialDuplicates,
-      message: `Scan completed: ${potentialDuplicates.length} potential duplicates found, ${skippedCount} not current month, ${errorCount} errors`
-    };
+  if (queuedForReviewCount > 0) {
+    ctx.waitUntil(sendPushNotification(env, {
+      title: `🔁 ${queuedForReviewCount} possible duplicate${queuedForReviewCount === 1 ? "" : "s"} found`,
+      body: `From your latest CSV import — tap to review and approve if needed`,
+      url: "/?review-duplicates=1",
+      actionLabel: "Review Now"
+    }));
   }
+  const duplicateCount = autoSkippedCount + queuedForReviewCount;
+  const totalTransactions = importedCount + duplicateCount + skippedCount;
+  return {
+    success: true,
+    importedCount,
+    duplicateCount,
+    autoSkippedCount,
+    queuedForReviewCount,
+    skippedCount,
+    totalTransactions,
+    errorCount,
+    message: `Import completed: ${importedCount} imported, ${autoSkippedCount} exact duplicates auto-skipped, ${queuedForReviewCount} possible duplicates flagged for review, ${skippedCount} not current month, ${errorCount} errors`
+  };
 }
 __name(importTransactionsFromCSV, "importTransactionsFromCSV");
 
@@ -644,11 +764,26 @@ var index_default = {
       if (url.pathname === "/api/receipts/status" && request.method === "GET") {
         return await handleReceiptStatus(env);
       }
+      if (/^\/api\/receipts\/\d+\/candidates$/.test(url.pathname) && request.method === "GET") {
+        return await handleGetReceiptMatchCandidates(env, url.pathname.split("/")[3]);
+      }
+      if (/^\/api\/receipts\/\d+\/match$/.test(url.pathname) && request.method === "POST") {
+        return await handleMatchReceiptToTransaction(request, env, ctx, url.pathname.split("/")[3]);
+      }
+      if (url.pathname === "/api/auto-categorizations" && request.method === "GET") {
+        return await handleGetAutoCategorizationLog(env);
+      }
       if (url.pathname === "/api/duplicates" && request.method === "GET") {
         return await handleGetDuplicates(env);
       }
       if (/^\/api\/duplicates\/\d+\/dismiss$/.test(url.pathname) && request.method === "POST") {
         return await handleDismissDuplicate(request, env);
+      }
+      if (url.pathname === "/api/csv-duplicates" && request.method === "GET") {
+        return await handleGetCsvImportDuplicates(env);
+      }
+      if (/^\/api\/csv-duplicates\/\d+\/resolve$/.test(url.pathname) && request.method === "POST") {
+        return await handleResolveCsvImportDuplicate(request, env, ctx, url.pathname.split("/")[3]);
       }
       if (url.pathname === "/api/pending" && request.method === "GET") {
         return await handlePending(env);
@@ -761,9 +896,14 @@ var index_default = {
   async scheduled(event, env, ctx) {
     if (event.cron === "0 7,19 * * *") {
       ctx.waitUntil(refreshPlaidBalanceCache(env).catch((err) => console.error("Scheduled balance refresh failed:", err)));
+      ctx.waitUntil(
+        env.DB.prepare("DELETE FROM auto_categorization_log WHERE created_at < datetime('now', '-10 days')").run()
+          .catch((err) => console.error("Auto-categorization log cleanup failed:", err))
+      );
     }
     if (event.cron === "*/30 * * * *") {
-      ctx.waitUntil(processWalmartReceipts(env, ctx).catch((err) => console.error("Scheduled receipt check failed:", err)));
+      ctx.waitUntil(processWalmartReceipts(env, ctx).catch((err) => console.error("Scheduled Walmart receipt check failed:", err)));
+      ctx.waitUntil(processAmazonReceipts(env, ctx).catch((err) => console.error("Scheduled Amazon receipt check failed:", err)));
     }
   }
 };
@@ -810,8 +950,10 @@ async function handleIncomingSms(request, env, ctx) {
     return jsonResponse({ success: true, action: "payment_recorded", amount: parsed.amount });
   }
   let suggestedCategoryId = null;
+  let suggestionMethod = null;
+  let suggestionDetail = null;
   if (parsed.merchant) {
-    suggestedCategoryId = await suggestCategoryId(env, parsed.merchant, smsBody);
+    ({ categoryId: suggestedCategoryId, method: suggestionMethod, detail: suggestionDetail } = await suggestCategoryId(env, parsed.merchant, smsBody));
   }
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const status = !parsed.parsedSuccessfully ? "needs_review" : suggestedCategoryId ? "categorized" : "pending";
@@ -831,6 +973,16 @@ async function handleIncomingSms(request, env, ctx) {
     status === "categorized" ? now : null
   ).run();
   const transactionId = insertResult.meta.last_row_id;
+  if (suggestedCategoryId) {
+    await recordAutoCategorization(env, {
+      transactionId,
+      merchant: parsed.merchant,
+      amount: parsed.amount,
+      categoryId: suggestedCategoryId,
+      method: suggestionMethod,
+      detail: suggestionDetail
+    });
+  }
   const receiptResult = await tryMatchUnclaimedReceipt(env, ctx, {
     transactionId,
     merchant: parsed.merchant,
@@ -1005,7 +1157,7 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
     }
 
     const duplicate = isDuplicateCheckExcluded(merchant) ? null : await findLikelyDuplicate(env, { merchant, amount: Math.abs(amount), occurredAt });
-    const suggestedCategoryId = await suggestCategoryId(env, merchant, merchant);
+    const { categoryId: suggestedCategoryId, method: suggestionMethod, detail: suggestionDetail } = await suggestCategoryId(env, merchant, merchant);
     const status = suggestedCategoryId ? "categorized" : "pending";
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const insertResult = await env.DB.prepare(
@@ -1032,6 +1184,16 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
         await env.DB.prepare(
           "INSERT INTO duplicate_flags (transaction_id, matched_transaction_id) VALUES (?, ?)"
         ).bind(transactionId, duplicate.id).run();
+      }
+      if (suggestedCategoryId) {
+        await recordAutoCategorization(env, {
+          transactionId,
+          merchant,
+          amount: Math.abs(amount),
+          categoryId: suggestedCategoryId,
+          method: suggestionMethod,
+          detail: suggestionDetail
+        });
       }
       const receiptResult = await tryMatchUnclaimedReceipt(env, ctx, {
         transactionId,
@@ -1303,6 +1465,56 @@ function findReceiptAttachmentPart(payload) {
   return null;
 }
 __name(findReceiptAttachmentPart, "findReceiptAttachmentPart");
+async function listUnprocessedAmazonReceiptEmails(accessToken) {
+  const data = await gmailFetch(accessToken, `/messages?q=${encodeURIComponent("subject:Ordered")}`);
+  return (data.messages || []).map((m) => m.id);
+}
+__name(listUnprocessedAmazonReceiptEmails, "listUnprocessedAmazonReceiptEmails");
+function getMessageHeader(message, name) {
+  return message.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || null;
+}
+__name(getMessageHeader, "getMessageHeader");
+function findEmailBodyPart(payload, mimeType) {
+  if (!payload) return null;
+  if (payload.mimeType === mimeType && payload.body?.data) return payload.body.data;
+  for (const part of payload.parts || []) {
+    const found = findEmailBodyPart(part, mimeType);
+    if (found) return found;
+  }
+  return null;
+}
+__name(findEmailBodyPart, "findEmailBodyPart");
+function stripHtmlToText(html) {
+  return html
+    .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim();
+}
+__name(stripHtmlToText, "stripHtmlToText");
+function extractEmailBodyText(payload) {
+  const plainData = findEmailBodyPart(payload, "text/plain");
+  if (plainData) {
+    const text = new TextDecoder().decode(base64UrlToBytes(plainData)).trim();
+    if (text) return text;
+  }
+  const htmlData = findEmailBodyPart(payload, "text/html");
+  if (htmlData) {
+    const text = stripHtmlToText(new TextDecoder().decode(base64UrlToBytes(htmlData)));
+    if (text) return text;
+  }
+  return null;
+}
+__name(extractEmailBodyText, "extractEmailBodyText");
 var RECEIPT_SCHEMA = {
   type: "object",
   properties: {
@@ -1388,54 +1600,148 @@ Respond with structured JSON only, matching the given schema.`;
   return JSON.parse(textBlock.text);
 }
 __name(parseAndCategorizeReceipt, "parseAndCategorizeReceipt");
-async function findMatchingWalmartTransaction(env, receiptDate, receiptTotal) {
+async function parseAndCategorizeAmazonEmail(env, bodyText, emailDateHeader) {
+  const { results: categories } = await env.DB.prepare(
+    "SELECT name FROM categories WHERE is_active = 1"
+  ).all();
+  const categoryNames = categories.map((c) => c.name);
+  const prompt = `This is the text of an email forwarded into a receipts inbox that is expected to be
+an Amazon.com order-confirmation email, but since it was manually forwarded, it may contain
+forwarding headers, quoted text, or occasionally be something else entirely (a shipping update, an
+unrelated forwarded email, etc.).
+
+First decide: does this email actually contain an Amazon order confirmation with purchased items
+and a grand total? If not, set isReceipt to false and leave the other fields as empty/zero
+placeholders — don't try to force-fit unrelated content into receipt fields.
+
+If it is an order confirmation: extract every ordered line item with its description and price.
+Amazon order-confirmation emails typically show only a "Grand Total" with no separate subtotal or
+tax line — in that case, set subtotal to the sum of the item prices, and set taxTotal to
+(total - subtotal). If the email does show an explicit subtotal/tax breakdown instead, use those
+printed values directly.
+
+Convert the order date to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
+lookups, so it must be a real, correctly converted calendar date. Prefer an explicit order date
+found in the email text itself (e.g. inside a forwarded "Date:" header or an "Order Placed" line)
+if present; otherwise fall back to this email's received date: ${emailDateHeader || "unknown"}.
+
+Categorize each item into one of these existing budget categories when a reasonable match
+exists: ${categoryNames.join(", ")}.
+If no existing category fits well, choose a short, sensible new category name instead of
+forcing a bad match.
+
+Set each item's "uncertain" flag to true whenever you are not genuinely confident in its
+category — a vague or abbreviated product title, or anything you're guessing at rather than
+reading clearly. Set it to false only when you're confident. Err toward true rather than force a
+bad guess.
+
+Respond with structured JSON only, matching the given schema.
+
+Email text:
+${bodyText}`;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 4096,
+      thinking: { type: "disabled" },
+      output_config: { format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
+      messages: [
+        { role: "user", content: [{ type: "text", text: prompt }] }
+      ]
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Claude Amazon email parse failed (${res.status}):`, data);
+    throw new Error(data.error?.message || "Claude Amazon email parse failed");
+  }
+  const textBlock = data.content.find((b) => b.type === "text");
+  if (!textBlock) {
+    throw new Error("Claude response had no text content block");
+  }
+  return JSON.parse(textBlock.text);
+}
+__name(parseAndCategorizeAmazonEmail, "parseAndCategorizeAmazonEmail");
+var RECEIPT_SOURCES = {
+  // Bank/CSV feeds render the same store under wildly different raw
+  // descriptors depending on register/terminal ("POS WAL-MART #3380...",
+  // "POS WM SUPERCENTER #3380...") — a single "%walmart%" substring check
+  // missed most of them. List every known variant explicitly.
+  walmart: {
+    merchantLikePatterns: ["%walmart%", "%wal-mart%", "%wal mart%", "%wm supercenter%"],
+    merchantRegex: /wal[\s-]?mart|wm\s*supercenter/i
+  },
+  amazon: { merchantLikePatterns: ["%amazon%"], merchantRegex: /amazon/i }
+};
+function merchantLikeClause(source) {
+  const patterns = RECEIPT_SOURCES[source]?.merchantLikePatterns || [`%${source}%`];
+  return { sql: `(${patterns.map(() => "LOWER(merchant) LIKE ?").join(" OR ")})`, patterns };
+}
+__name(merchantLikeClause, "merchantLikeClause");
+// Bank posting dates routinely lag a day or more behind the receipt/order
+// date (observed: Walmart charges consistently post ~1 day after the
+// receipt email arrives) — an exact date match made every one of these
+// silently "stuck" forever. Allow a small window instead of an exact match.
+var RECEIPT_DATE_MATCH_TOLERANCE_DAYS = 3;
+async function findMatchingTransaction(env, source, receiptDate, receiptTotal) {
   // Only ever touch a transaction still sitting as "pending" — the moment
   // anything (an auto merchant-map guess or a manual tap) resolves it, the
   // receipt job must not reach back in and override that decision.
+  const { sql, patterns } = merchantLikeClause(source);
   const { results } = await env.DB.prepare(
     `SELECT * FROM transactions
-    WHERE LOWER(merchant) LIKE '%walmart%'
-      AND date(occurred_at) = date(?)
+    WHERE ${sql}
+      AND ABS(julianday(date(occurred_at)) - julianday(date(?))) <= ?
       AND ABS(amount - ?) <= 0.01
       AND status = 'pending'`
-  ).bind(receiptDate, receiptTotal).all();
+  ).bind(...patterns, receiptDate, RECEIPT_DATE_MATCH_TOLERANCE_DAYS, receiptTotal).all();
   if (results.length !== 1) return null;
   return results[0];
 }
-__name(findMatchingWalmartTransaction, "findMatchingWalmartTransaction");
-async function findAnyMatchingWalmartTransaction(env, receiptDate, receiptTotal) {
+__name(findMatchingTransaction, "findMatchingTransaction");
+async function findAnyMatchingTransaction(env, source, receiptDate, receiptTotal) {
   // Broader existence check (any status) used only to distinguish "no
   // transaction has arrived yet" from "one arrived and was already resolved
   // by something else" — the latter means the receipt is now moot.
+  const { sql, patterns } = merchantLikeClause(source);
   const { results } = await env.DB.prepare(
     `SELECT * FROM transactions
-    WHERE LOWER(merchant) LIKE '%walmart%'
-      AND date(occurred_at) = date(?)
+    WHERE ${sql}
+      AND ABS(julianday(date(occurred_at)) - julianday(date(?))) <= ?
       AND ABS(amount - ?) <= 0.01`
-  ).bind(receiptDate, receiptTotal).all();
+  ).bind(...patterns, receiptDate, RECEIPT_DATE_MATCH_TOLERANCE_DAYS, receiptTotal).all();
   if (results.length !== 1) return null;
   return results[0];
 }
-__name(findAnyMatchingWalmartTransaction, "findAnyMatchingWalmartTransaction");
+__name(findAnyMatchingTransaction, "findAnyMatchingTransaction");
 async function findMatchingUnclaimedReceipt(env, merchant, amount, occurredAt) {
-  if (!/walmart/i.test(merchant || "")) return null;
+  const source = Object.entries(RECEIPT_SOURCES).find(([, cfg]) => cfg.merchantRegex.test(merchant || ""))?.[0];
+  if (!source) return null;
   const { results } = await env.DB.prepare(
     `SELECT * FROM processed_receipt_emails
     WHERE status = 'no_transaction_match'
       AND matched_transaction_id IS NULL
-      AND date(receipt_date) = date(?)
+      AND source = ?
+      AND ABS(julianday(date(receipt_date)) - julianday(date(?))) <= ?
       AND ABS(receipt_total - ?) <= 0.01`
-  ).bind(occurredAt, amount).all();
+  ).bind(source, occurredAt, RECEIPT_DATE_MATCH_TOLERANCE_DAYS, amount).all();
   if (results.length !== 1) return null;
   return results[0];
 }
 __name(findMatchingUnclaimedReceipt, "findMatchingUnclaimedReceipt");
-async function recordProcessedReceiptEmail(env, { messageId, status, receiptTotal, receiptDate, parsedJson, matchedTransactionId, detail }) {
+async function recordProcessedReceiptEmail(env, { messageId, source, status, receiptTotal, receiptDate, parsedJson, matchedTransactionId, detail }) {
   await env.DB.prepare(
     `INSERT INTO processed_receipt_emails
-    (gmail_message_id, receipt_total, receipt_date, parsed_json, matched_transaction_id, status, detail)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    (gmail_message_id, source, receipt_total, receipt_date, parsed_json, matched_transaction_id, status, detail)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(gmail_message_id) DO UPDATE SET
+      source = excluded.source,
       receipt_total = excluded.receipt_total,
       receipt_date = excluded.receipt_date,
       parsed_json = excluded.parsed_json,
@@ -1444,6 +1750,7 @@ async function recordProcessedReceiptEmail(env, { messageId, status, receiptTota
       detail = excluded.detail`
   ).bind(
     messageId,
+    source,
     receiptTotal ?? null,
     receiptDate ?? null,
     parsedJson ? JSON.stringify(parsedJson) : null,
@@ -1500,7 +1807,7 @@ async function flagTransactionNeedsReceiptReview(env, transactionId, parsed) {
   return uncertainItems.map((i) => i.description).join(", ");
 }
 __name(flagTransactionNeedsReceiptReview, "flagTransactionNeedsReceiptReview");
-async function applyReceiptResult(env, transactionId, parsed, transactionAmount) {
+async function applyReceiptResult(env, transactionId, parsed, transactionAmount, { merchant, source } = {}) {
   if (parsed.items.some((i) => i.uncertain)) {
     const uncertainSummary = await flagTransactionNeedsReceiptReview(env, transactionId, parsed);
     return { outcome: "needs_review", summary: `Needs review: ${uncertainSummary}` };
@@ -1554,6 +1861,15 @@ async function applyReceiptResult(env, transactionId, parsed, transactionAmount)
     `🧾 Auto-categorized from receipt:
 ${groupedItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} — $${i.amount.toFixed(2)} → ${i.category}`).join("\n")}`
   );
+  await recordAutoCategorization(env, {
+    transactionId,
+    merchant,
+    amount: transactionAmount,
+    categoryId: entries.length === 1 ? entries[0].categoryId : null,
+    method: "receipt",
+    source,
+    detail: summary
+  });
   return { outcome: "matched", summary };
 }
 __name(applyReceiptResult, "applyReceiptResult");
@@ -1571,7 +1887,7 @@ async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amo
   if (!unclaimedReceipt) return null;
   try {
     const parsedJson = JSON.parse(unclaimedReceipt.parsed_json);
-    const receiptResult = await applyReceiptResult(env, transactionId, parsedJson, amount);
+    const receiptResult = await applyReceiptResult(env, transactionId, parsedJson, amount, { merchant, source: unclaimedReceipt.source });
     await env.DB.prepare(
       "UPDATE processed_receipt_emails SET matched_transaction_id = ?, status = ? WHERE id = ?"
     ).bind(transactionId, receiptResult.outcome, unclaimedReceipt.id).run();
@@ -1588,14 +1904,16 @@ async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amo
 }
 __name(tryMatchUnclaimedReceipt, "tryMatchUnclaimedReceipt");
 async function notifyGmailAuthFailureIfNeeded(env, ctx) {
-  const row = await env.DB.prepare("SELECT last_auth_failure_notified_at FROM receipt_job_runs WHERE id = 1").first();
+  // Shared across all receipt sources — one Gmail token, so one throttle row
+  // (source = '_auth') rather than duplicate alerts per source.
+  const row = await env.DB.prepare("SELECT last_auth_failure_notified_at FROM receipt_job_runs WHERE source = '_auth'").first();
   const lastNotified = row?.last_auth_failure_notified_at ? new Date(row.last_auth_failure_notified_at) : null;
   const hoursSinceNotified = lastNotified ? (Date.now() - lastNotified.getTime()) / 3600000 : Infinity;
   if (hoursSinceNotified < 12) return;
   const now = (/* @__PURE__ */ new Date()).toISOString();
   await env.DB.prepare(
-    `INSERT INTO receipt_job_runs (id, last_auth_failure_notified_at) VALUES (1, ?)
-    ON CONFLICT(id) DO UPDATE SET last_auth_failure_notified_at = excluded.last_auth_failure_notified_at`
+    `INSERT INTO receipt_job_runs (source, last_auth_failure_notified_at) VALUES ('_auth', ?)
+    ON CONFLICT(source) DO UPDATE SET last_auth_failure_notified_at = excluded.last_auth_failure_notified_at`
   ).bind(now).run();
   ctx.waitUntil(sendPushNotification(env, {
     title: "⚠️ Receipt inbox connection broken",
@@ -1604,7 +1922,7 @@ async function notifyGmailAuthFailureIfNeeded(env, ctx) {
   ctx.waitUntil(notifyMacroDroid(env, "⚠️ Gmail receipt connection broken — refresh token needs renewal."));
 }
 __name(notifyGmailAuthFailureIfNeeded, "notifyGmailAuthFailureIfNeeded");
-async function processWalmartReceipts(env, ctx) {
+async function processReceiptEmails(env, ctx, source, { listCandidateIds, extractAndParse }) {
   let accessToken;
   try {
     accessToken = await getGmailAccessToken(env);
@@ -1613,7 +1931,7 @@ async function processWalmartReceipts(env, ctx) {
     await notifyGmailAuthFailureIfNeeded(env, ctx);
     throw err;
   }
-  const candidateIds = await listUnprocessedWalmartReceiptEmails(accessToken);
+  const candidateIds = await listCandidateIds(accessToken);
   const { results: alreadyProcessed } = await env.DB.prepare(
     "SELECT gmail_message_id FROM processed_receipt_emails"
   ).all();
@@ -1623,16 +1941,15 @@ async function processWalmartReceipts(env, ctx) {
   for (const messageId of messageIds) {
     try {
       const message = await fetchGmailMessage(accessToken, messageId);
-      const part = findReceiptAttachmentPart(message.payload);
-      if (!part) {
-        await recordProcessedReceiptEmail(env, { messageId, status: "no_attachment" });
-        summary.push({ messageId, status: "no_attachment" });
+      const extraction = await extractAndParse(accessToken, message);
+      if (extraction.skip) {
+        await recordProcessedReceiptEmail(env, { messageId, source, status: extraction.status });
+        summary.push({ messageId, status: extraction.status });
         continue;
       }
-      const bytes = await fetchGmailAttachment(accessToken, messageId, part.attachmentId);
-      const parsed = await parseAndCategorizeReceipt(env, bytes, part.mimeType);
+      const parsed = extraction.parsed;
       if (!parsed.isReceipt) {
-        await recordProcessedReceiptEmail(env, { messageId, status: "not_a_receipt" });
+        await recordProcessedReceiptEmail(env, { messageId, source, status: "not_a_receipt" });
         summary.push({ messageId, status: "not_a_receipt" });
         continue;
       }
@@ -1640,6 +1957,7 @@ async function processWalmartReceipts(env, ctx) {
       if (Math.abs(itemSum - parsed.subtotal) > 0.01) {
         await recordProcessedReceiptEmail(env, {
           messageId,
+          source,
           status: "parse_error",
           receiptTotal: parsed.total,
           receiptDate: parsed.date,
@@ -1649,16 +1967,17 @@ async function processWalmartReceipts(env, ctx) {
         summary.push({ messageId, status: "parse_error" });
         continue;
       }
-      const txn = await findMatchingWalmartTransaction(env, parsed.date, parsed.total);
+      const txn = await findMatchingTransaction(env, source, parsed.date, parsed.total);
       if (!txn) {
         // No still-pending transaction to attach to. Distinguish "one exists
         // but was already resolved by something else in the meantime" (the
         // receipt is now moot — discard it) from "nothing has arrived yet"
         // (keep parsed_json around so a later Plaid sync can claim it).
-        const alreadyResolved = await findAnyMatchingWalmartTransaction(env, parsed.date, parsed.total);
+        const alreadyResolved = await findAnyMatchingTransaction(env, source, parsed.date, parsed.total);
         if (alreadyResolved) {
           await recordProcessedReceiptEmail(env, {
             messageId,
+            source,
             status: "already_complete",
             receiptTotal: parsed.total,
             receiptDate: parsed.date,
@@ -1670,6 +1989,7 @@ async function processWalmartReceipts(env, ctx) {
         }
         await recordProcessedReceiptEmail(env, {
           messageId,
+          source,
           status: "no_transaction_match",
           receiptTotal: parsed.total,
           receiptDate: parsed.date,
@@ -1678,9 +1998,10 @@ async function processWalmartReceipts(env, ctx) {
         summary.push({ messageId, status: "no_transaction_match" });
         continue;
       }
-      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount);
+      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount, { merchant: txn.merchant, source });
       await recordProcessedReceiptEmail(env, {
         messageId,
+        source,
         status: result.outcome,
         receiptTotal: parsed.total,
         receiptDate: parsed.date,
@@ -1690,53 +2011,147 @@ async function processWalmartReceipts(env, ctx) {
       });
       summary.push({ messageId, status: result.outcome, transactionId: txn.id });
       ctx.waitUntil(sendPushNotification(env, {
-        title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || "Walmart"}` : `Auto-categorized: ${txn.merchant || "Walmart"}`,
+        title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || source}` : `Auto-categorized: ${txn.merchant || source}`,
         body: result.outcome === "needs_review" ? `$${txn.amount.toFixed(2)} — tap to categorize manually` : `$${txn.amount.toFixed(2)} — ${result.summary}`,
         transactionId: txn.id
       }));
     } catch (err) {
       console.error(`Receipt processing failed for message ${messageId}:`, err);
-      await recordProcessedReceiptEmail(env, { messageId, status: "parse_error", detail: err.message });
+      await recordProcessedReceiptEmail(env, { messageId, source, status: "parse_error", detail: err.message });
       summary.push({ messageId, status: "error", error: err.message });
     }
   }
   const now = (/* @__PURE__ */ new Date()).toISOString();
   await env.DB.prepare(
-    `INSERT INTO receipt_job_runs (id, last_run_at, last_run_count, last_auth_failure_notified_at) VALUES (1, ?, ?, NULL)
-    ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at, last_run_count = excluded.last_run_count, last_auth_failure_notified_at = NULL`
-  ).bind(now, summary.length).run();
+    `INSERT INTO receipt_job_runs (source, last_run_at, last_run_count, last_auth_failure_notified_at) VALUES (?, ?, ?, NULL)
+    ON CONFLICT(source) DO UPDATE SET last_run_at = excluded.last_run_at, last_run_count = excluded.last_run_count, last_auth_failure_notified_at = NULL`
+  ).bind(source, now, summary.length).run();
   return { count: summary.length, results: summary };
 }
+__name(processReceiptEmails, "processReceiptEmails");
+async function processWalmartReceipts(env, ctx) {
+  return processReceiptEmails(env, ctx, "walmart", {
+    listCandidateIds: listUnprocessedWalmartReceiptEmails,
+    extractAndParse: async (accessToken, message) => {
+      const part = findReceiptAttachmentPart(message.payload);
+      if (!part) return { skip: true, status: "no_attachment" };
+      const bytes = await fetchGmailAttachment(accessToken, message.id, part.attachmentId);
+      const parsed = await parseAndCategorizeReceipt(env, bytes, part.mimeType);
+      return { parsed };
+    }
+  });
+}
 __name(processWalmartReceipts, "processWalmartReceipts");
+async function processAmazonReceipts(env, ctx) {
+  return processReceiptEmails(env, ctx, "amazon", {
+    listCandidateIds: listUnprocessedAmazonReceiptEmails,
+    extractAndParse: async (accessToken, message) => {
+      const bodyText = extractEmailBodyText(message.payload);
+      if (!bodyText) return { skip: true, status: "no_body_text" };
+      const dateHeader = getMessageHeader(message, "Date");
+      const parsed = await parseAndCategorizeAmazonEmail(env, bodyText, dateHeader);
+      return { parsed };
+    }
+  });
+}
+__name(processAmazonReceipts, "processAmazonReceipts");
+async function runAllReceiptSources(env, ctx) {
+  const [walmart, amazon] = await Promise.all([
+    processWalmartReceipts(env, ctx),
+    processAmazonReceipts(env, ctx)
+  ]);
+  return { count: walmart.count + amazon.count, results: [...walmart.results, ...amazon.results] };
+}
+__name(runAllReceiptSources, "runAllReceiptSources");
 async function handleReceiptCheckNow(request, env, ctx) {
   const providedSecret = request.headers.get("X-Budget-Secret");
   if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
-  const result = await processWalmartReceipts(env, ctx);
+  const result = await runAllReceiptSources(env, ctx);
   return jsonResponse({ success: true, ...result });
 }
 async function handleReceiptSyncNow(env, ctx) {
-  const result = await processWalmartReceipts(env, ctx);
+  const result = await runAllReceiptSources(env, ctx);
   return jsonResponse({ success: true, ...result });
 }
 __name(handleReceiptSyncNow, "handleReceiptSyncNow");
 async function handleReceiptStatus(env) {
-  const runRow = await env.DB.prepare(
-    "SELECT last_run_at, last_run_count FROM receipt_job_runs WHERE id = 1"
-  ).first();
+  const { results: runRows } = await env.DB.prepare(
+    "SELECT source, last_run_at, last_run_count FROM receipt_job_runs WHERE source IN ('walmart', 'amazon')"
+  ).all();
+  const lastRunAt = runRows.reduce((max, r) => (r.last_run_at && (!max || r.last_run_at > max) ? r.last_run_at : max), null);
+  const lastRunCount = runRows.some((r) => r.last_run_count != null)
+    ? runRows.reduce((sum, r) => sum + (r.last_run_count || 0), 0)
+    : null;
   const { results: unclaimed } = await env.DB.prepare(
-    `SELECT id, receipt_total, receipt_date, processed_at FROM processed_receipt_emails
+    `SELECT id, source, receipt_total, receipt_date, processed_at FROM processed_receipt_emails
     WHERE status = 'no_transaction_match' ORDER BY processed_at DESC`
   ).all();
   return jsonResponse({
-    lastRunAt: runRow?.last_run_at || null,
-    lastRunCount: runRow?.last_run_count ?? null,
+    lastRunAt,
+    lastRunCount,
     unclaimedReceipts: unclaimed
   });
 }
 __name(handleReceiptStatus, "handleReceiptStatus");
+async function handleGetReceiptMatchCandidates(env, receiptId) {
+  const receipt = await env.DB.prepare(
+    "SELECT * FROM processed_receipt_emails WHERE id = ?"
+  ).bind(receiptId).first();
+  if (!receipt) return jsonResponse({ error: "Receipt not found" }, 404);
+  const { sql, patterns } = merchantLikeClause(receipt.source);
+  const { results: candidates } = await env.DB.prepare(
+    `SELECT id, merchant, amount, occurred_at, status, category_id FROM transactions
+    WHERE ${sql}
+      AND date(occurred_at) BETWEEN date(?, '-14 days') AND date(?, '+14 days')
+    ORDER BY ABS(amount - ?) ASC, occurred_at DESC
+    LIMIT 20`
+  ).bind(...patterns, receipt.receipt_date, receipt.receipt_date, receipt.receipt_total).all();
+  return jsonResponse({ receipt, candidates });
+}
+__name(handleGetReceiptMatchCandidates, "handleGetReceiptMatchCandidates");
+async function handleMatchReceiptToTransaction(request, env, ctx, receiptId) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { transactionId } = body;
+  if (!transactionId) return jsonResponse({ error: "transactionId is required" }, 400);
+  const receipt = await env.DB.prepare(
+    "SELECT * FROM processed_receipt_emails WHERE id = ?"
+  ).bind(receiptId).first();
+  if (!receipt || !receipt.parsed_json) return jsonResponse({ error: "Receipt not found or has no parsed data" }, 404);
+  const txn = await env.DB.prepare("SELECT * FROM transactions WHERE id = ?").bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  const parsedJson = JSON.parse(receipt.parsed_json);
+  const result = await applyReceiptResult(env, transactionId, parsedJson, txn.amount, { merchant: txn.merchant, source: receipt.source });
+  await env.DB.prepare(
+    "UPDATE processed_receipt_emails SET matched_transaction_id = ?, status = ? WHERE id = ?"
+  ).bind(transactionId, result.outcome, receipt.id).run();
+  ctx.waitUntil(sendPushNotification(env, {
+    title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || "Unknown"}` : `Auto-categorized: ${txn.merchant || "Unknown"}`,
+    body: result.outcome === "needs_review" ? `$${txn.amount.toFixed(2)} — tap to categorize manually` : `$${txn.amount.toFixed(2)} — ${result.summary}`,
+    transactionId
+  }));
+  return jsonResponse({ success: true, ...result });
+}
+__name(handleMatchReceiptToTransaction, "handleMatchReceiptToTransaction");
 __name(handleReceiptCheckNow, "handleReceiptCheckNow");
+async function handleGetAutoCategorizationLog(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT l.id, l.transaction_id AS transactionId, l.merchant, l.amount, l.method, l.source, l.detail, l.created_at AS createdAt,
+    c.name AS categoryName, c.icon AS categoryIcon
+    FROM auto_categorization_log l
+    LEFT JOIN categories c ON l.category_id = c.id
+    WHERE l.created_at >= datetime('now', '-10 days')
+    ORDER BY l.created_at DESC`
+  ).all();
+  return jsonResponse({ entries: results });
+}
+__name(handleGetAutoCategorizationLog, "handleGetAutoCategorizationLog");
 async function handleGetDuplicates(env) {
   const { results } = await env.DB.prepare(
     `SELECT
@@ -1766,12 +2181,74 @@ async function handleDismissDuplicate(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleDismissDuplicate, "handleDismissDuplicate");
+async function handleGetCsvImportDuplicates(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT d.id, d.raw_data, d.merchant, d.amount, d.occurred_at, d.transaction_type, d.created_at,
+    e.id AS existingId, e.merchant AS existingMerchant, e.amount AS existingAmount, e.occurred_at AS existingOccurredAt, e.status AS existingStatus
+    FROM csv_import_duplicates d
+    LEFT JOIN transactions e ON e.id = d.existing_transaction_id
+    WHERE d.status = 'pending_review'
+    ORDER BY d.created_at DESC`
+  ).all();
+  const duplicates = results.map((row) => ({
+    id: row.id,
+    rawData: row.raw_data,
+    merchant: row.merchant,
+    amount: row.amount,
+    occurredAt: row.occurred_at,
+    transactionType: row.transaction_type,
+    createdAt: row.created_at,
+    existingTransaction: row.existingId ? {
+      id: row.existingId,
+      merchant: row.existingMerchant,
+      amount: row.existingAmount,
+      occurredAt: row.existingOccurredAt,
+      status: row.existingStatus
+    } : null
+  }));
+  return jsonResponse({ duplicates });
+}
+__name(handleGetCsvImportDuplicates, "handleGetCsvImportDuplicates");
+async function handleResolveCsvImportDuplicate(request, env, ctx, duplicateId) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { action } = body;
+  if (action !== "skip" && action !== "import") {
+    return jsonResponse({ error: "action must be 'skip' or 'import'" }, 400);
+  }
+  const dup = await env.DB.prepare(
+    "SELECT * FROM csv_import_duplicates WHERE id = ? AND status = 'pending_review'"
+  ).bind(duplicateId).first();
+  if (!dup) return jsonResponse({ error: "Duplicate not found or already resolved" }, 404);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  let transactionId = null;
+  if (action === "import") {
+    transactionId = await insertCsvTransaction(env, ctx, {
+      rawData: dup.raw_data,
+      merchant: dup.merchant,
+      amount: dup.amount,
+      occurredAt: dup.occurred_at,
+      transactionType: dup.transaction_type
+    });
+  }
+  await env.DB.prepare(
+    "UPDATE csv_import_duplicates SET status = ?, resolved_at = ? WHERE id = ?"
+  ).bind(action === "import" ? "imported" : "skipped", now, duplicateId).run();
+  return jsonResponse({ success: true, action, transactionId });
+}
+__name(handleResolveCsvImportDuplicate, "handleResolveCsvImportDuplicate");
 async function handlePending(env) {
   const { results } = await env.DB.prepare(
-    `SELECT id, amount, merchant, card_last4, transaction_type, occurred_at, status, plaid_pending
-    FROM transactions
-    WHERE status IN ('pending', 'needs_review')
-    ORDER BY occurred_at DESC`
+    `SELECT t.id, t.amount, t.merchant, t.card_last4, t.transaction_type, t.occurred_at, t.status, t.plaid_pending,
+    COALESCE(n.notes, '') AS notes
+    FROM transactions t
+    LEFT JOIN transaction_notes n ON t.id = n.transaction_id
+    WHERE t.status IN ('pending', 'needs_review')
+    ORDER BY t.occurred_at DESC`
   ).all();
   const withSuggestions = await Promise.all(
     results.map(async (txn) => {
@@ -2604,13 +3081,14 @@ async function handleDeleteTransaction(request, env) {
 __name(handleDeleteTransaction, "handleDeleteTransaction");
 async function handleCSVTransactionImport(request, env, ctx) {
   try {
-    const csvData = await request.text();
+    const contentType = request.headers.get("Content-Type") || "";
+    const csvData = contentType.includes("application/json")
+      ? (await request.json()).csvData
+      : await request.text();
     if (!csvData || csvData.trim() === "") {
       return jsonResponse({ error: "No CSV data provided" }, 400);
     }
-    const url = new URL(request.url);
-    const scanOnly = url.searchParams.get("scanOnly") === "true";
-    const result = await importTransactionsFromCSV(env, ctx, csvData, !scanOnly);
+    const result = await importTransactionsFromCSV(env, ctx, csvData);
     if (!result.success) {
       return jsonResponse({ error: result.error || "CSV import failed" }, 400);
     }

@@ -1,10 +1,10 @@
 const API = location.origin;
 
-// Pending Walmart charges get auto-categorized from a matched receipt within
-// ~30 min (see the receipt-check cron) — flag them so the user doesn't jump
-// in and categorize manually while that's still in flight.
+// Pending Walmart/Amazon charges get auto-categorized from a matched receipt
+// within ~30 min (see the receipt-check cron) — flag them so the user doesn't
+// jump in and categorize manually while that's still in flight.
 function awaitingReceiptBadgeHtml(txn) {
-  if (txn.status !== 'pending' || !/walmart/i.test(txn.merchant || '')) return '';
+  if (txn.status !== 'pending' || !/wal[\s-]?mart|wm\s*supercenter|amazon/i.test(txn.merchant || '')) return '';
   return ' <span class="awaiting-receipt-badge">awaiting receipt</span>';
 }
 
@@ -14,6 +14,8 @@ let state = {
   pending: [],
   recurringTransactions: [],
   duplicates: [],
+  autoLog: [],
+  csvDuplicates: [],
   currentTxn: null,
   currentSplitTxn: null,
   currentCategoryDetailId: null,
@@ -111,10 +113,42 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   document.getElementById('btn-save-split')?.addEventListener('click', saveSplit);
   document.getElementById('btn-add-split-row')?.addEventListener('click', () => addSplitRow());
+  document.getElementById('btn-categorize-single')?.addEventListener('click', categorizeSplitAsSingleCategory);
   document.getElementById('modal-split')?.addEventListener('click', (e) => {
     if (e.target.id === 'modal-split') {
       closeSplitModal();
       restoreCategoryDetailModalIfNeeded();
+    }
+  });
+
+  // Esc closes whichever dialog is currently open. At most one of these is
+  // ever visible at a time (opening one hides any other it stacks over,
+  // e.g. Notes/Split hide Category Detail underneath), so check innermost
+  // dialogs first and mirror each one's own Cancel/backdrop-click behavior
+  // exactly (including restoring Category Detail where applicable) rather
+  // than just hiding the element.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!document.getElementById('modal-split')?.classList.contains('hidden')) {
+      closeSplitModal();
+      restoreCategoryDetailModalIfNeeded();
+    } else if (!document.getElementById('modal-notes')?.classList.contains('hidden')) {
+      closeNotesModal();
+      restoreCategoryDetailModalIfNeeded();
+    } else if (!document.getElementById('modal-categorize')?.classList.contains('hidden')) {
+      closeModal();
+    } else if (!document.getElementById('modal-edit-category')?.classList.contains('hidden')) {
+      closeEditModal();
+    } else if (!document.getElementById('modal-duplicates')?.classList.contains('hidden')) {
+      closeDuplicatesModal();
+    } else if (!document.getElementById('modal-auto-log')?.classList.contains('hidden')) {
+      closeAutoLogModal();
+    } else if (!document.getElementById('modal-match-receipt')?.classList.contains('hidden')) {
+      closeMatchReceiptModal();
+    } else if (!document.getElementById('modal-csv-duplicates')?.classList.contains('hidden')) {
+      closeCsvDuplicatesModal();
+    } else if (!document.getElementById('modal-category-detail')?.classList.contains('hidden')) {
+      closeCategoryDetail();
     }
   });
 
@@ -152,10 +186,32 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (e.target.id === 'modal-duplicates') closeDuplicatesModal();
   });
 
+  // Add event listeners for auto-categorization-log badge/modal
+  document.getElementById('auto-log-badge')?.addEventListener('click', openAutoLogModal);
+  document.getElementById('btn-close-auto-log')?.addEventListener('click', closeAutoLogModal);
+  document.getElementById('modal-auto-log')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-auto-log') closeAutoLogModal();
+  });
+
+  // Add event listeners for the manual receipt-match modal
+  document.getElementById('btn-close-match-receipt')?.addEventListener('click', closeMatchReceiptModal);
+  document.getElementById('modal-match-receipt')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-match-receipt') closeMatchReceiptModal();
+  });
+
+  // Add event listeners for the CSV import duplicates badge/modal
+  document.getElementById('csv-duplicates-badge')?.addEventListener('click', openCsvDuplicatesModal);
+  document.getElementById('btn-close-csv-duplicates')?.addEventListener('click', closeCsvDuplicatesModal);
+  document.getElementById('modal-csv-duplicates')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-csv-duplicates') closeCsvDuplicatesModal();
+  });
+
   document.getElementById('btn-sync-plaid')?.addEventListener('click', syncPlaidNow);
   document.getElementById('btn-connect-bank')?.addEventListener('click', connectBank);
   document.getElementById('btn-check-receipts')?.addEventListener('click', checkReceiptsNow);
   setInterval(loadReceiptStatus, 60000);
+  setInterval(loadAutoCategorizationLog, 60000);
+  setInterval(loadCsvDuplicates, 60000);
 
   // Add event listeners for import/export buttons
   document.getElementById('btn-export')?.addEventListener('click', exportDatabase);
@@ -173,6 +229,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   } else {
     await loadAll();
     showApp();
+  }
+
+  if (new URLSearchParams(window.location.search).get('review-duplicates')) {
+    openCsvDuplicatesModal();
   }
 
   if (window.location.href.includes('oauth_state_id=')) {
@@ -202,6 +262,8 @@ async function loadAll() {
     { label: 'Account balance', fn: loadBalance },
     { label: 'Duplicate check', fn: loadDuplicates },
     { label: 'Receipt status', fn: loadReceiptStatus },
+    { label: 'Auto-categorization log', fn: loadAutoCategorizationLog },
+    { label: 'CSV import duplicates', fn: loadCsvDuplicates },
   ];
   const completedLabels = new Set();
   setLoadingStatus(`Loading ${steps.map((s) => s.label).join(', ')}…`, 5);
@@ -304,6 +366,84 @@ function openDuplicatesModal() {
 
 function closeDuplicatesModal() {
   document.getElementById('modal-duplicates').classList.add('hidden');
+}
+
+async function loadAutoCategorizationLog() {
+  try {
+    const data = await apiFetch('/api/auto-categorizations');
+    state.autoLog = data.entries;
+    updateAutoLogBadge(data.entries.length);
+  } catch (err) {
+    console.error('Auto-categorization log load failed:', err);
+  }
+}
+
+function updateAutoLogBadge(count) {
+  const badge = document.getElementById('auto-log-badge');
+  if (count > 0) {
+    badge.textContent = count;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function autoLogMethodLabel(entry) {
+  if (entry.method === 'receipt') {
+    const merchantLabel = entry.source === 'amazon' ? 'Amazon' : entry.source === 'walmart' ? 'Walmart' : 'Receipt';
+    return `🧾 ${merchantLabel} receipt`;
+  }
+  if (entry.method === 'merchant_map') return '🔁 remembered merchant';
+  if (entry.method === 'auto_label') return '🏷️ auto-detected';
+  return entry.method;
+}
+
+function renderAutoLog() {
+  const list = document.getElementById('auto-log-list');
+  if (!state.autoLog.length) {
+    list.innerHTML = '<div class="empty-state">No auto-categorized transactions in the last 10 days</div>';
+    return;
+  }
+  list.innerHTML = '';
+  state.autoLog.forEach((entry) => {
+    const row = document.createElement('div');
+    row.className = 'duplicate-pair auto-log-row';
+    const categoryLabel = entry.categoryName ? `${entry.categoryIcon || ''} ${entry.categoryName}` : 'Split across categories';
+    row.innerHTML = `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">${entry.merchant || 'Unknown merchant'}</div>
+          <div class="duplicate-txn-meta">${categoryLabel} · ${autoLogMethodLabel(entry)} · ${formatRelativeTime(entry.createdAt)}</div>
+        </div>
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(entry.amount)}</div>
+        </div>
+      </div>
+    `;
+    row.addEventListener('click', () => openAutoLogEntryDetail(entry.transactionId));
+    list.appendChild(row);
+  });
+}
+
+async function openAutoLogEntryDetail(transactionId) {
+  if (!transactionId) return;
+  try {
+    const txn = await apiFetch(`/api/transactions/${transactionId}`);
+    closeAutoLogModal();
+    openNotesModal(txn);
+  } catch (err) {
+    console.error('Failed to load transaction from auto-log:', err);
+    alert('That transaction could not be found (it may have been deleted).');
+  }
+}
+
+function openAutoLogModal() {
+  renderAutoLog();
+  document.getElementById('modal-auto-log').classList.remove('hidden');
+}
+
+function closeAutoLogModal() {
+  document.getElementById('modal-auto-log').classList.add('hidden');
 }
 
 function formatRelativeTime(isoString) {
@@ -410,12 +550,78 @@ function renderUnclaimedReceipts(receipts) {
     return;
   }
   listEl.classList.remove('hidden');
-  listEl.innerHTML = receipts.map((r) => `
-    <div class="unclaimed-receipt-row">
+  listEl.innerHTML = '';
+  receipts.forEach((r) => {
+    const row = document.createElement('div');
+    row.className = 'unclaimed-receipt-row unclaimed-receipt-row-clickable';
+    row.innerHTML = `
       <span class="unclaimed-receipt-icon">🧾</span>
-      <span class="unclaimed-receipt-text">Receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — waiting for the bank to report this transaction</span>
-    </div>
-  `).join('');
+      <span class="unclaimed-receipt-text">Receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — waiting for the bank to report this transaction (tap to attach manually)</span>
+    `;
+    row.addEventListener('click', () => openMatchReceiptModal(r));
+    listEl.appendChild(row);
+  });
+}
+
+// ============================================================
+// Manual Receipt Match Modal
+// ============================================================
+
+async function openMatchReceiptModal(receipt) {
+  document.getElementById('match-receipt-label').textContent = `Attach $${receipt.receipt_total.toFixed(2)} receipt (${formatDate(receipt.receipt_date)}) to:`;
+  const listEl = document.getElementById('match-receipt-candidates');
+  listEl.innerHTML = '<div class="empty-state">Loading…</div>';
+  document.getElementById('modal-match-receipt').classList.remove('hidden');
+  let data;
+  try {
+    data = await apiFetch(`/api/receipts/${receipt.id}/candidates`);
+  } catch (err) {
+    console.error('Failed to load match candidates:', err);
+    listEl.innerHTML = '<div class="empty-state">Failed to load candidate transactions</div>';
+    return;
+  }
+  if (!data.candidates.length) {
+    listEl.innerHTML = '<div class="empty-state">No nearby transactions found for this merchant</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  data.candidates.forEach((txn) => {
+    const row = document.createElement('div');
+    row.className = 'duplicate-pair auto-log-row';
+    const statusLabel = txn.status === 'categorized' ? '(currently categorized — will be overridden)' : `(${txn.status})`;
+    row.innerHTML = `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">${txn.merchant || 'Unknown merchant'}</div>
+          <div class="duplicate-txn-meta">${formatDate(txn.occurred_at)} · ${statusLabel}</div>
+        </div>
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(txn.amount)}</div>
+        </div>
+      </div>
+    `;
+    row.addEventListener('click', () => matchReceiptToTransaction(receipt.id, txn.id));
+    listEl.appendChild(row);
+  });
+}
+
+async function matchReceiptToTransaction(receiptId, transactionId) {
+  try {
+    await apiFetch(`/api/receipts/${receiptId}/match`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transactionId }),
+    });
+    closeMatchReceiptModal();
+    await Promise.all([loadReceiptStatus(), refreshAfterTransactionChange(), loadAutoCategorizationLog()]);
+  } catch (err) {
+    console.error('Match receipt failed:', err);
+    alert(`Failed to attach receipt: ${err.message}`);
+  }
+}
+
+function closeMatchReceiptModal() {
+  document.getElementById('modal-match-receipt').classList.add('hidden');
 }
 
 async function loadReceiptStatus() {
@@ -758,11 +964,28 @@ function renderDashboard(data) {
 const chartSlices = {}; // canvasId -> [{ startAngle, endAngle, innerR, outerR, cx, cy, data }]
 const chartHoverBound = {}; // canvasId -> bool
 
+const PIE_OTHERS_THRESHOLD = 0.05;
+
 function drawPie(categories) {
   const cats = categories.filter((c) => c.spent > 0);
-  drawDonut('pie-chart', 'pie-tooltip', cats.map((cat) => ({
-    label: cat.name, icon: cat.icon, color: cat.color, amount: cat.spent
-  })), { outerR: 220, innerR: 144, gap: 0.03 });
+  const total = cats.reduce((s, c) => s + c.spent, 0);
+  // Visual-only grouping: anything under 5% of total spend gets folded into
+  // a single "Others" slice so the chart doesn't turn into a wall of tiny
+  // slivers. Doesn't touch the underlying category data anywhere else.
+  const major = [];
+  let othersTotal = 0;
+  cats.forEach((cat) => {
+    if (total > 0 && cat.spent / total < PIE_OTHERS_THRESHOLD) {
+      othersTotal += cat.spent;
+    } else {
+      major.push(cat);
+    }
+  });
+  const items = major.map((cat) => ({ label: cat.name, icon: cat.icon, color: cat.color, amount: cat.spent }));
+  if (othersTotal > 0) {
+    items.push({ label: 'Others', icon: '➕', color: '#4b5563', amount: othersTotal });
+  }
+  drawDonut('pie-chart', 'pie-tooltip', items, { outerR: 220, innerR: 144, gap: 0 });
 }
 
 function drawDonut(canvasId, tooltipId, items, { outerR, innerR, gap } = {}) {
@@ -792,7 +1015,15 @@ function drawDonut(canvasId, tooltipId, items, { outerR, innerR, gap } = {}) {
   const sliceGap = gap ?? (items.length > 1 ? 0.05 : 0);
 
   items.forEach((item) => {
-    const sliceAngle = (item.amount / total) * (Math.PI * 2) - sliceGap;
+    // Clamp at 0: for a slice thinner than the gap itself (a very small
+    // category), the raw share minus the gap goes negative, which makes
+    // endAngle < startAngle. ctx.arc() with no anticlockwise flag then
+    // sweeps the long way around (clockwise, wrapping past 2π) instead of
+    // drawing a tiny sliver — painting almost the entire donut in that
+    // item's color and clobbering everything drawn before it. Clamping
+    // means a slice that thin just doesn't get a visible gap-separated
+    // wedge, which is correct — it's too small to show one anyway.
+    const sliceAngle = Math.max(0, (item.amount / total) * (Math.PI * 2) - sliceGap);
     const endAngle = startAngle + sliceAngle;
     ctx.beginPath();
     ctx.moveTo(cx, cy);
@@ -1069,16 +1300,25 @@ function renderPending(transactions) {
   }
   list.innerHTML = '';
   transactions.forEach((txn) => {
+    const isReceiptFlagged = txn.status === 'needs_review' && txn.notes && txn.notes.startsWith('⚠️ Auto-flagged by receipt scan');
     const card = document.createElement('div');
     card.className = 'pending-card';
     card.innerHTML = `
       <div class="pending-info">
         <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="pending-date">${formatDate(txn.occurred_at)}</div>
+        ${isReceiptFlagged ? '<div class="pending-receipt-hint">🧾 tap to review items &amp; split</div>' : ''}
       </div>
       <div class="pending-amount">${fmt(txn.amount)}</div>
     `;
-    card.addEventListener('click', () => openCategorizeModal(txn));
+    card.addEventListener('click', () => {
+      if (isReceiptFlagged) {
+        state.currentTxn = txn;
+        openSplitModal();
+      } else {
+        openCategorizeModal(txn);
+      }
+    });
     list.appendChild(card);
   });
 }
@@ -1280,6 +1520,7 @@ function renderSettings(categories) {
     const included = cat.included_in_budget === undefined ? true : !!cat.included_in_budget;
     const row = document.createElement('div');
     row.className = 'settings-row';
+    row.style.borderLeftColor = cat.color || 'transparent';
     row.innerHTML = `
       <div class="settings-icon">${cat.icon}</div>
       <div class="settings-main">
@@ -1840,6 +2081,30 @@ function openNotesModal(transaction) {
 // Split Transaction Modal Functions
 // ============================================================
 
+// Renders an auto-generated note (e.g. "⚠️ Auto-flagged by receipt scan...")
+// as one block per line, with bullet lines given a hanging indent so a long
+// item description wraps under the text rather than under the bullet.
+function renderReceiptItemsNote(container, notesText) {
+  container.innerHTML = '';
+  if (!notesText) {
+    container.classList.add('hidden');
+    return;
+  }
+  container.classList.remove('hidden');
+  notesText.split('\n').forEach((line) => {
+    const bulletMatch = line.match(/^\s*•\s*(.*)$/);
+    const div = document.createElement('div');
+    if (bulletMatch) {
+      div.className = 'split-receipt-item-line';
+      div.textContent = `• ${bulletMatch[1]}`;
+    } else {
+      div.className = 'split-receipt-items-header';
+      div.textContent = line;
+    }
+    container.appendChild(div);
+  });
+}
+
 async function openSplitModal() {
   const transactionId = state.currentTxn.id;
 
@@ -1850,6 +2115,7 @@ async function openSplitModal() {
   document.getElementById('split-total').textContent = '';
   document.getElementById('split-rows').innerHTML = '';
   document.getElementById('split-remaining').textContent = '';
+  document.getElementById('split-receipt-items').classList.add('hidden');
   document.getElementById('modal-split').classList.remove('hidden');
 
   let txn;
@@ -1865,11 +2131,39 @@ async function openSplitModal() {
   document.getElementById('split-merchant').textContent = txn.merchant || 'Unknown merchant';
   document.getElementById('split-total').textContent = fmt(txn.amount);
 
+  renderReceiptItemsNote(document.getElementById('split-receipt-items'), txn.notes);
+
   const initialRows = txn.is_split && txn.splits?.length
     ? txn.splits.map((s) => ({ categoryId: s.categoryId, amount: s.amount }))
     : [{ categoryId: '', amount: '' }, { categoryId: '', amount: '' }];
   initialRows.forEach((row) => addSplitRow(row.categoryId, row.amount));
   updateSplitRemaining();
+
+  const singleCategorySelect = document.getElementById('split-single-category');
+  singleCategorySelect.innerHTML = '<option value="">Choose category</option>' +
+    state.categories.map((cat) => `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`).join('');
+  singleCategorySelect.value = !txn.is_split && txn.category_id ? txn.category_id : '';
+}
+
+async function categorizeSplitAsSingleCategory() {
+  const categoryId = Number(document.getElementById('split-single-category').value);
+  if (!categoryId) {
+    alert('Choose a category first');
+    return;
+  }
+  try {
+    await apiFetch('/api/categorize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transactionId: state.currentSplitTxn.id, categoryId }),
+    });
+    closeSplitModal();
+    restoreCategoryDetailModalIfNeeded();
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    console.error('Categorize failed:', err);
+    alert('Failed to categorize');
+  }
 }
 
 function addSplitRow(categoryId, amount) {
@@ -2000,12 +2294,6 @@ async function saveNotes() {
 // ============================================================
 
 // Global variable to track CSV import state
-let csvImportState = {
-  fileContent: null,
-  potentialDuplicates: [],
-  currentDuplicateIndex: 0
-};
-
 async function importCSVTransactions(event) {
   const file = event.target.files[0];
   if (!file) return;
@@ -2016,90 +2304,16 @@ async function importCSVTransactions(event) {
     return;
   }
 
-  try {
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      try {
-        const csvContent = e.target.result;
-
-        // Store the file content for later use
-        csvImportState.fileContent = csvContent;
-        csvImportState.potentialDuplicates = [];
-        csvImportState.currentDuplicateIndex = 0;
-
-        const btn = document.getElementById('btn-csv-import');
-        btn.textContent = 'Scanning for duplicates...';
-        btn.disabled = true;
-
-        // First scan for potential duplicates
-        const scanResponse = await fetch('/api/transactions/csv?scanOnly=true', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'text/csv',
-          },
-          body: csvContent,
-        });
-
-        if (!scanResponse.ok) {
-          const errorData = await scanResponse.json();
-          throw new Error(errorData.error || `CSV scan failed: ${scanResponse.status}`);
-        }
-
-        const scanResult = await scanResponse.json();
-
-        if (scanResult.potentialDuplicates && scanResult.potentialDuplicates.length > 0) {
-          // Show duplicate resolution dialog
-          csvImportState.potentialDuplicates = scanResult.potentialDuplicates;
-          showDuplicateResolutionDialog(0);
-        } else {
-          // No duplicates found, proceed with automatic import
-          proceedWithCSVImport();
-        }
-
-      } catch (err) {
-        console.error('CSV import failed:', err);
-        alert('CSV import failed: ' + err.message);
-        const btn = document.getElementById('btn-csv-import');
-        btn.textContent = 'Import CSV Transactions';
-        btn.style.background = '';
-        btn.disabled = false;
-        event.target.value = '';
-      }
-    };
-    reader.readAsText(file);
-
-  } catch (err) {
-    console.error('CSV import failed:', err);
-    alert('CSV import failed: ' + err.message);
-    const btn = document.getElementById('btn-csv-import');
-    btn.textContent = 'Import CSV Transactions';
-    btn.style.background = '';
-    btn.disabled = false;
-    event.target.value = '';
-  }
-}
-
-async function proceedWithCSVImport() {
   const btn = document.getElementById('btn-csv-import');
   btn.textContent = 'Importing...';
   btn.disabled = true;
 
   try {
-    // Get all transactions that were approved by user (not skipped)
-    const approvedTransactions = csvImportState.potentialDuplicates
-      .filter(dup => {
-        // In our current implementation, we skip all duplicates
-        // In a full implementation, we would track user choices here
-        return false; // Currently skipping all duplicates
-      })
-      .map(dup => dup.transaction);
-
+    const csvContent = await file.text();
     const response = await fetch('/api/transactions/csv', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'text/csv',
-      },
-      body: csvImportState.fileContent,
+      headers: { 'Content-Type': 'text/csv' },
+      body: csvContent,
     });
 
     if (!response.ok) {
@@ -2109,7 +2323,6 @@ async function proceedWithCSVImport() {
 
     const result = await response.json();
 
-    // Show success feedback
     btn.textContent = 'Imported ✓';
     btn.style.background = '#16a34a';
     setTimeout(() => {
@@ -2118,30 +2331,24 @@ async function proceedWithCSVImport() {
       btn.disabled = false;
     }, 1500);
 
-    // Clear the file input
     document.getElementById('csv-file-input').value = '';
 
-    // Refresh data
-    await Promise.all([loadPending(), loadDashboard()]);
+    await Promise.all([loadPending(), loadDashboard(), loadCsvDuplicates()]);
     if (activeView === 'transactions') {
       await loadTransactions();
     }
 
-    // Calculate actual results based on what was imported
-    // Use the total transactions count from the backend and subtract skipped transactions
-    const totalTransactions = result.totalTransactions || 0;
-    const actuallySkippedDuplicates = csvImportState.potentialDuplicates.length; // Duplicates that were skipped
-    const nonCurrentMonthSkipped = result.skippedCount; // Transactions not from current month
-    const totalSkipped = actuallySkippedDuplicates + nonCurrentMonthSkipped;
-    const actuallyImported = totalTransactions - totalSkipped; // Calculate imported count
+    alert(`CSV Import Complete!\n\n${result.importedCount} transactions imported\n${result.autoSkippedCount} exact duplicates auto-skipped\n${result.queuedForReviewCount} possible duplicates flagged for review\n${result.skippedCount} transactions not from current month\n${result.errorCount} errors encountered`);
 
-    // Show detailed results to user with accurate imported count
-    alert(`CSV Import Complete!\n\n${actuallyImported} transactions imported\n${actuallySkippedDuplicates} duplicates skipped\n${nonCurrentMonthSkipped} transactions not from current month\n${result.errorCount} errors encountered`);
-
+    // Same-tap convenience: if this import just flagged anything ambiguous,
+    // let the user resolve it immediately instead of having to go find the
+    // badge. Exact duplicates never reach here — they're auto-skipped.
+    if (result.queuedForReviewCount > 0) {
+      openCsvDuplicatesModal();
+    }
   } catch (err) {
     console.error('CSV import failed:', err);
     alert('CSV import failed: ' + err.message);
-    const btn = document.getElementById('btn-csv-import');
     btn.textContent = 'Import CSV Transactions';
     btn.style.background = '';
     btn.disabled = false;
@@ -2149,88 +2356,95 @@ async function proceedWithCSVImport() {
   }
 }
 
-function showDuplicateResolutionDialog(duplicateIndex) {
-  if (duplicateIndex >= csvImportState.potentialDuplicates.length) {
-    // All duplicates resolved, proceed with import
-    proceedWithCSVImport();
+// ============================================================
+// CSV Import Duplicate Review (manual button + unattended
+// watch_downloads.py watcher both flow through the same backend queue)
+// ============================================================
+
+async function loadCsvDuplicates() {
+  try {
+    const data = await apiFetch('/api/csv-duplicates');
+    state.csvDuplicates = data.duplicates;
+    updateCsvDuplicatesBadge(data.duplicates.length);
+  } catch (err) {
+    console.error('Loading CSV duplicates failed:', err);
+  }
+}
+
+function updateCsvDuplicatesBadge(count) {
+  const badge = document.getElementById('csv-duplicates-badge');
+  if (!badge) return;
+  if (count > 0) {
+    badge.textContent = count;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function openCsvDuplicatesModal() {
+  renderCsvDuplicates();
+  document.getElementById('modal-csv-duplicates').classList.remove('hidden');
+}
+
+function closeCsvDuplicatesModal() {
+  document.getElementById('modal-csv-duplicates').classList.add('hidden');
+}
+
+function renderCsvDuplicates() {
+  const list = document.getElementById('csv-duplicates-list');
+  if (!state.csvDuplicates.length) {
+    list.innerHTML = '<div class="empty-state">No possible duplicates waiting for review 🎉</div>';
     return;
   }
-
-  const duplicate = csvImportState.potentialDuplicates[duplicateIndex];
-  const newTxn = duplicate.transaction;
-  const existingTxn = duplicate.existingTransaction;
-
-  // Format dates for display
-  const formatDateForDisplay = (dateStr) => {
-    let date;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-      const [year, month, day] = dateStr.split('-').map(Number);
-      date = new Date(year, month - 1, day);
-    } else {
-      date = new Date(dateStr);
-    }
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric'
-    });
-  };
-
-  // Create modal HTML
-  const modalHTML = `
-    <div class="modal-overlay">
-      <div class="duplicate-modal">
-        <h3>Potential Duplicate Transaction</h3>
-        <p>We found a potential duplicate transaction. Please review and choose an action:</p>
-
-        <div class="duplicate-comparison">
-          <div class="transaction-existing">
-            <h4>Existing Transaction</h4>
-            <p><strong>Merchant:</strong> ${existingTxn.merchant}</p>
-            <p><strong>Amount:</strong> $${existingTxn.amount.toFixed(2)}</p>
-            <p><strong>Date:</strong> ${formatDateForDisplay(existingTxn.occurred_at)}</p>
-          </div>
-
-          <div class="transaction-new">
-            <h4>New Transaction</h4>
-            <p><strong>Merchant:</strong> ${newTxn.merchant}</p>
-            <p><strong>Amount:</strong> $${newTxn.amount.toFixed(2)}</p>
-            <p><strong>Date:</strong> ${formatDateForDisplay(newTxn.occurredAt)}</p>
-          </div>
+  list.innerHTML = '';
+  state.csvDuplicates.forEach((dup) => {
+    const row = document.createElement('div');
+    row.className = 'duplicate-pair';
+    const existing = dup.existingTransaction;
+    row.innerHTML = `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">New: ${dup.merchant || 'Unknown merchant'}</div>
+          <div class="duplicate-txn-meta">${formatDate(dup.occurredAt)}</div>
         </div>
-
-        <p style="margin-top: 16px; font-size: 14px; color: var(--text-dim);">
-          These transactions have the same amount and similar merchant names (8+ character match).
-        </p>
-
-        <div class="duplicate-actions">
-          <button id="btn-skip-duplicate" class="btn-skip">Skip This Transaction</button>
-          <button id="btn-import-duplicate" class="btn-import">Import Anyway</button>
-        </div>
-
-        <div class="duplicate-progress">
-          Processing duplicate ${duplicateIndex + 1} of ${csvImportState.potentialDuplicates.length}
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(dup.amount)}</div>
         </div>
       </div>
-    </div>
-  `;
-
-  // Add modal to body
-  const modalContainer = document.createElement('div');
-  modalContainer.id = 'duplicate-resolution-modal';
-  modalContainer.innerHTML = modalHTML;
-  document.body.appendChild(modalContainer);
-
-  // Add event listeners
-  document.getElementById('btn-skip-duplicate').addEventListener('click', () => {
-    document.body.removeChild(modalContainer);
-    showDuplicateResolutionDialog(duplicateIndex + 1);
+      ${existing ? `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">Existing: ${existing.merchant || 'Unknown merchant'}</div>
+          <div class="duplicate-txn-meta">${formatDate(existing.occurredAt)} · ${existing.status}</div>
+        </div>
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(existing.amount)}</div>
+        </div>
+      </div>` : ''}
+      <div class="csv-duplicate-actions">
+        <button type="button" class="btn-cancel-notes btn-skip-csv-duplicate">Skip</button>
+        <button type="button" class="btn-save-notes btn-import-csv-duplicate">Import Anyway</button>
+      </div>
+    `;
+    row.querySelector('.btn-skip-csv-duplicate').addEventListener('click', () => resolveCsvDuplicate(dup.id, 'skip'));
+    row.querySelector('.btn-import-csv-duplicate').addEventListener('click', () => resolveCsvDuplicate(dup.id, 'import'));
+    list.appendChild(row);
   });
+}
 
-  document.getElementById('btn-import-duplicate').addEventListener('click', () => {
-    document.body.removeChild(modalContainer);
-    // For now, we'll skip all duplicates in the first pass
-    // In a full implementation, we would track user choices and import selected ones
-    showDuplicateResolutionDialog(duplicateIndex + 1);
-  });
+async function resolveCsvDuplicate(duplicateId, action) {
+  try {
+    await apiFetch(`/api/csv-duplicates/${duplicateId}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    await loadCsvDuplicates();
+    renderCsvDuplicates();
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    console.error('Resolve CSV duplicate failed:', err);
+    alert(`Failed to resolve: ${err.message}`);
+  }
 }

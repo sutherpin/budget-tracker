@@ -1,6 +1,6 @@
 // sw.js — Service Worker
 // Handles Web Push notifications and offline caching
-const CACHE_NAME = 'budget-tracker-v5';
+const CACHE_NAME = 'budget-tracker-v6';
 const STATIC_ASSETS = ['/', '/app.js', '/style.css', '/manifest.json'];
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -36,13 +36,14 @@ self.addEventListener('fetch', (event) => {
 self.addEventListener('push', (event) => {
   const data = event.data ? event.data.json() : {};
   const title = data.title || 'New Transaction';
+  const url = data.url || '/?pending=1';
   const options = {
     body: data.body || 'Tap to categorize',
     icon: '/icon-192.png',
     badge: '/icon-192.png',
     tag: 'transaction-' + (data.transactionId || Date.now()),
-                      data: { transactionId: data.transactionId, url: '/?pending=1' },
-                      actions: [{ action: 'categorize', title: 'Categorize Now' }],
+                      data: { transactionId: data.transactionId, url },
+                      actions: [{ action: 'categorize', title: data.actionLabel || 'Categorize Now' }],
                       requireInteraction: true,
   };
   event.waitUntil(self.registration.showNotification(title, options));

@@ -40,6 +40,8 @@
           <button class="btn-theme-toggle" id="btn-theme-toggle" title="Toggle day/night mode">🌙</button>
           <div class="topbar-badge topbar-badge-duplicate hidden" id="duplicate-badge" title="Possible duplicate transactions">0</div>
           <div class="topbar-badge hidden" id="pending-badge" title="Transactions needing categorization">0</div>
+          <div class="topbar-badge topbar-badge-autolog hidden" id="auto-log-badge" title="Auto-categorized in the last 10 days">0</div>
+          <div class="topbar-badge topbar-badge-csvdup hidden" id="csv-duplicates-badge" title="CSV import: possible duplicates waiting for review">0</div>
         </div>
       </header>
 
@@ -307,6 +309,15 @@
           <div class="notes-merchant" id="split-merchant">MERCHANT</div>
           <div class="notes-amount" id="split-total">$0.00</div>
         </div>
+        <div class="split-receipt-items transaction-notes hidden" id="split-receipt-items"></div>
+        <div class="modal-label">Just one category?</div>
+        <div class="split-single-category-row">
+          <select id="split-single-category">
+            <option value="">Choose category</option>
+          </select>
+          <button type="button" class="btn-save-notes" id="btn-categorize-single">Use this category</button>
+        </div>
+        <div class="split-or-divider">— or split across multiple categories —</div>
         <div class="modal-label">Split into up to 3 categories</div>
         <div class="split-rows" id="split-rows"></div>
         <button class="btn-add-split-row" id="btn-add-split-row">+ Add category</button>
@@ -362,6 +373,33 @@
         <div class="modal-label">Possible Duplicates</div>
         <div class="duplicate-list" id="duplicate-list"></div>
         <button class="btn-close-category-detail" id="btn-close-duplicates">Close</button>
+      </div>
+    </div>
+
+    <!-- Auto-Categorization Log Modal -->
+    <div class="modal hidden" id="modal-auto-log">
+      <div class="modal-card">
+        <div class="modal-label">Auto-Categorized (last 10 days)</div>
+        <div class="duplicate-list" id="auto-log-list"></div>
+        <button class="btn-close-category-detail" id="btn-close-auto-log">Close</button>
+      </div>
+    </div>
+
+    <!-- Manual Receipt Match Modal -->
+    <div class="modal hidden" id="modal-match-receipt">
+      <div class="modal-card">
+        <div class="modal-label" id="match-receipt-label">Attach receipt to a transaction</div>
+        <div class="duplicate-list" id="match-receipt-candidates"></div>
+        <button class="btn-close-category-detail" id="btn-close-match-receipt">Cancel</button>
+      </div>
+    </div>
+
+    <!-- CSV Import Duplicates Review Modal -->
+    <div class="modal hidden" id="modal-csv-duplicates">
+      <div class="modal-card">
+        <div class="modal-label">CSV Import: Possible Duplicates</div>
+        <div class="duplicate-list" id="csv-duplicates-list"></div>
+        <button class="btn-close-category-detail" id="btn-close-csv-duplicates">Close</button>
       </div>
     </div>
   </div>
