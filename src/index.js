@@ -563,10 +563,15 @@ async function suggestCategoryId(env, merchant, rawText) {
     return { categoryId: null, method: null };
   }
   if (merchant) {
-    const suggestion = await env.DB.prepare(
-      "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
-    ).bind(merchant).first();
-    if (suggestion) return { categoryId: suggestion.category_id, method: "merchant_map" };
+    // Only an exact match auto-applies here — a fuzzy match is real
+    // evidence (see findMerchantCategoryMatch) but not enough to flip
+    // status to 'categorized' without a human glancing at it once. It still
+    // gets surfaced as a one-tap suggestion on the pending list instead of
+    // being silently dropped (see handlePending).
+    const match = await findMerchantCategoryMatch(env, merchant);
+    if (match && match.confidence === "exact") {
+      return { categoryId: match.categoryId, method: "merchant_map" };
+    }
   }
   const autoLabel = matchAutoCategoryLabel(merchant, rawText);
   if (autoLabel) return { categoryId: await resolveCategoryIdByLabel(env, autoLabel), method: "auto_label", detail: autoLabel };
@@ -1090,21 +1095,63 @@ function normalizeMerchant(merchant) {
   return (merchant || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 __name(normalizeMerchant, "normalizeMerchant");
+// The same "is this really the same merchant" question comes up for two
+// different reasons — is this transaction a duplicate of one already on
+// file, and does this merchant match anything we've categorized before —
+// and both were answering it with their own copy-pasted heuristic. One
+// shared predicate now backs both, regardless of which vector (Plaid, CSV,
+// SMS) the transaction arrived on.
+function isFuzzyMerchantMatch(a, b) {
+  const na = normalizeMerchant(a);
+  const nb = normalizeMerchant(b);
+  if (!na || !nb) return false;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  return shorter.length >= 7 && longer.includes(shorter.slice(0, 7));
+}
+__name(isFuzzyMerchantMatch, "isFuzzyMerchantMatch");
+// Looks up what category this merchant has been assigned before. An exact
+// string match is high confidence — every ingestion vector (Plaid, CSV, SMS)
+// reports the same real-world merchant under a different raw string (e.g.
+// Plaid's clean "El Guero Tacos Garcia" vs. a CSV terminal's "EL GUERO TACOS
+// GARCIA PASCO WAUS"), so a fuzzy match against anything memorized before is
+// also checked — but flagged as lower confidence so callers can decide
+// whether to auto-apply it or just suggest it and leave the transaction
+// pending for a one-tap confirmation instead.
+async function findMerchantCategoryMatch(env, merchant) {
+  if (!merchant) return null;
+  const exact = await env.DB.prepare(
+    "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
+  ).bind(merchant).first();
+  if (exact) return { categoryId: exact.category_id, confidence: "exact" };
+  if (!normalizeMerchant(merchant)) return null;
+  const { results } = await env.DB.prepare(
+    "SELECT merchant, category_id FROM merchant_category_map"
+  ).all();
+  for (const row of results) {
+    if (isFuzzyMerchantMatch(merchant, row.merchant)) {
+      return { categoryId: row.category_id, confidence: "fuzzy" };
+    }
+  }
+  return null;
+}
+__name(findMerchantCategoryMatch, "findMerchantCategoryMatch");
+// A pending charge (from a CSV export or SMS alert) and its later Plaid-
+// posted counterpart routinely land a day or more apart — the bank shows the
+// authorization date while pending, then the settlement date once posted.
+// An exact date match here missed exactly that case (e.g. a CSV row dated
+// the 16th vs. the Plaid-posted row dated the 17th for the same charge), so
+// this needs the same kind of tolerance window findPotentialDuplicate's
+// receipt-family tier already uses.
+var DUPLICATE_DATE_MATCH_TOLERANCE_DAYS = 3;
 async function findLikelyDuplicate(env, { merchant, amount, occurredAt }) {
   const { results } = await env.DB.prepare(
     `SELECT id, merchant FROM transactions
-    WHERE amount = ? AND date(occurred_at) = date(?)`
-  ).bind(amount, occurredAt).all();
-  const incoming = normalizeMerchant(merchant);
-  if (!incoming) return null;
+    WHERE amount = ? AND ABS(julianday(date(occurred_at)) - julianday(date(?))) <= ?`
+  ).bind(amount, occurredAt, DUPLICATE_DATE_MATCH_TOLERANCE_DAYS).all();
+  if (!normalizeMerchant(merchant)) return null;
   for (const row of results) {
-    const existing = normalizeMerchant(row.merchant);
-    if (!existing) continue;
-    const shorter = incoming.length <= existing.length ? incoming : existing;
-    const longer = incoming.length <= existing.length ? existing : incoming;
-    if (shorter.length >= 7 && longer.includes(shorter.slice(0, 7))) {
-      return row;
-    }
+    if (isFuzzyMerchantMatch(merchant, row.merchant)) return row;
   }
   return null;
 }
@@ -2447,12 +2494,12 @@ async function handlePending(env) {
   const withSuggestions = await Promise.all(
     results.map(async (txn) => {
       if (!txn.merchant) return { ...txn, suggestedCategoryId: null };
-      const suggestion = await env.DB.prepare(
-        "SELECT category_id FROM merchant_category_map WHERE merchant = ?"
-      ).bind(txn.merchant).first();
+      // Fuzzy here is fine — this only pre-highlights a category button for
+      // the user to confirm with one tap, it never auto-applies anything.
+      const match = await findMerchantCategoryMatch(env, txn.merchant);
       return {
         ...txn,
-        suggestedCategoryId: suggestion ? suggestion.category_id : null
+        suggestedCategoryId: match ? match.categoryId : null
       };
     })
   );
