@@ -290,41 +290,54 @@
         </div>
         <div class="modal-label">Add/Edit Notes</div>
         <textarea id="notes-input" placeholder="Add notes about this transaction..." maxlength="255"></textarea>
-        <div class="modal-label">Change Category</div>
-        <select id="notes-category" class="notes-category-select">
-          <option value="">No category</option>
-        </select>
-        <button class="btn-split-transaction" id="btn-split-transaction">✂️ Split into multiple categories</button>
+
+        <!-- Receipt-backed transactions: item categories are edited inline here
+             instead of a separate Split screen — one screen for notes + categorization. -->
+        <div class="split-items-editor hidden" id="notes-items-editor">
+          <div class="modal-label">Item categories</div>
+          <div class="split-item-rows" id="notes-item-rows"></div>
+        </div>
+
+        <!-- Transactions with no receipt data: single category or dollar-amount split -->
+        <div id="notes-category-editor">
+          <div class="modal-label">Change Category</div>
+          <select id="notes-category" class="notes-category-select">
+            <option value="">No category</option>
+          </select>
+          <button class="btn-split-transaction" id="btn-split-transaction">✂️ Split into multiple categories</button>
+        </div>
+
         <div class="modal-notes-buttons">
           <button class="btn-cancel-notes" id="btn-cancel-notes">Cancel</button>
-          <button class="btn-save-notes" id="btn-save-notes">Save Notes</button>
+          <button class="btn-save-notes" id="btn-save-notes">Save</button>
         </div>
       </div>
     </div>
 
-    <!-- Split Transaction Modal -->
+    <!-- Split Transaction Modal (dollar-amount split, used only when there's no receipt) -->
     <div class="modal hidden" id="modal-split">
       <div class="modal-card">
         <div class="modal-notes-header">
           <div class="notes-merchant" id="split-merchant">MERCHANT</div>
           <div class="notes-amount" id="split-total">$0.00</div>
         </div>
-        <div class="split-receipt-items transaction-notes hidden" id="split-receipt-items"></div>
-        <div class="modal-label">Just one category?</div>
-        <div class="split-single-category-row">
-          <select id="split-single-category">
-            <option value="">Choose category</option>
-          </select>
-          <button type="button" class="btn-save-notes" id="btn-categorize-single">Use this category</button>
-        </div>
-        <div class="split-or-divider">— or split across multiple categories —</div>
-        <div class="modal-label">Split into up to 3 categories</div>
-        <div class="split-rows" id="split-rows"></div>
-        <button class="btn-add-split-row" id="btn-add-split-row">+ Add category</button>
-        <div class="split-remaining" id="split-remaining"></div>
-        <div class="modal-notes-buttons">
-          <button class="btn-cancel-notes" id="btn-cancel-split">Cancel</button>
-          <button class="btn-save-notes" id="btn-save-split">Save Split</button>
+        <div class="split-amount-editor" id="split-amount-editor">
+          <div class="modal-label">Just one category?</div>
+          <div class="split-single-category-row">
+            <select id="split-single-category">
+              <option value="">Choose category</option>
+            </select>
+            <button type="button" class="btn-save-notes" id="btn-categorize-single">Use this category</button>
+          </div>
+          <div class="split-or-divider">— or split across multiple categories —</div>
+          <div class="modal-label">Split into up to 3 categories</div>
+          <div class="split-rows" id="split-rows"></div>
+          <button class="btn-add-split-row" id="btn-add-split-row">+ Add category</button>
+          <div class="split-remaining" id="split-remaining"></div>
+          <div class="modal-notes-buttons">
+            <button class="btn-cancel-notes" id="btn-cancel-split">Cancel</button>
+            <button class="btn-save-notes" id="btn-save-split">Save Split</button>
+          </div>
         </div>
       </div>
     </div>
@@ -389,6 +402,7 @@
     <div class="modal hidden" id="modal-match-receipt">
       <div class="modal-card">
         <div class="modal-label" id="match-receipt-label">Attach receipt to a transaction</div>
+        <div class="split-receipt-items transaction-notes hidden" id="match-receipt-items"></div>
         <div class="duplicate-list" id="match-receipt-candidates"></div>
         <button class="btn-close-category-detail" id="btn-close-match-receipt">Cancel</button>
       </div>
@@ -400,6 +414,16 @@
         <div class="modal-label">CSV Import: Possible Duplicates</div>
         <div class="duplicate-list" id="csv-duplicates-list"></div>
         <button class="btn-close-category-detail" id="btn-close-csv-duplicates">Close</button>
+      </div>
+    </div>
+
+    <!-- Return/Refund Match Modal -->
+    <div class="modal hidden" id="modal-return-match">
+      <div class="modal-card">
+        <div class="modal-label" id="return-match-label">Match this return</div>
+        <div id="return-match-suggested" class="hidden"></div>
+        <div class="duplicate-list" id="return-match-candidates"></div>
+        <button class="btn-close-category-detail" id="btn-close-return-match">Cancel</button>
       </div>
     </div>
   </div>

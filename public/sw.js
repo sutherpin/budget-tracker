@@ -1,6 +1,6 @@
 // sw.js — Service Worker
 // Handles Web Push notifications and offline caching
-const CACHE_NAME = 'budget-tracker-v6';
+const CACHE_NAME = 'budget-tracker-v12';
 const STATIC_ASSETS = ['/', '/app.js', '/style.css', '/manifest.json'];
 self.addEventListener('install', (event) => {
   event.waitUntil(

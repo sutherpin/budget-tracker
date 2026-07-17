@@ -416,9 +416,13 @@ function parseTransactionFromCSV(row) {
   } else if (amount < 0) {
     transactionType = "purchase";
   } else {
-    const descriptionLower = description.toLowerCase();
-    const isLikelyDeposit = descriptionLower.includes("deposit") || descriptionLower.includes("transfer") || descriptionLower.includes("payroll") || descriptionLower.includes("direct deposit") || descriptionLower.includes("atm deposit") || descriptionLower.includes("mobile deposit") || descriptionLower.includes("salary") || descriptionLower.includes("interest") || descriptionLower.includes("credit") || descriptionLower.includes("payment");
-    transactionType = isLikelyDeposit ? "deposit" : "purchase";
+    // This bank's CSV convention is negative = purchase (handled above), so
+    // anything reaching here is already known non-negative — a positive
+    // amount with no purchase-side signal is a credit (deposit, refund,
+    // return, etc.), never a purchase. Previously defaulted to "purchase"
+    // here, which mis-typed every unlabeled credit (e.g. a store return)
+    // as a charge.
+    transactionType = "deposit";
   }
   return {
     description: description || "Unknown",
@@ -435,7 +439,7 @@ async function findPotentialDuplicate(env, transaction) {
   const exactMatch = await env.DB.prepare(
     `SELECT id, merchant, amount, occurred_at FROM transactions
     WHERE merchant = ?
-    AND amount = ?
+    AND ABS(amount) = ?
     AND strftime('%Y-%m-%d', occurred_at) = strftime('%Y-%m-%d', ?)`
   ).bind(
     transaction.merchant,
@@ -458,7 +462,7 @@ async function findPotentialDuplicate(env, transaction) {
     const familyMatch = await env.DB.prepare(
       `SELECT id, merchant, amount, occurred_at FROM transactions
       WHERE ${sql}
-        AND amount = ?
+        AND ABS(amount) = ?
         AND ABS(julianday(date(occurred_at)) - julianday(date(?))) <= ?`
     ).bind(...patterns, transaction.amount, transaction.occurredAt, RECEIPT_DATE_MATCH_TOLERANCE_DAYS).first();
     // Not "exact" — same family + amount doesn't rule out two separate
@@ -477,7 +481,7 @@ async function findPotentialDuplicate(env, transaction) {
   // as a substring of the longer one (either direction).
   const partialMatches = await env.DB.prepare(
     `SELECT id, merchant, amount, occurred_at FROM transactions
-    WHERE amount = ?
+    WHERE ABS(amount) = ?
     AND LENGTH(merchant) >= 4`
   ).bind(transaction.amount).all();
   for (const potentialMatch of partialMatches.results) {
@@ -542,12 +546,7 @@ async function resolveCategoryIdByLabel(env, label) {
   return insert.meta.last_row_id;
 }
 __name(resolveCategoryIdByLabel, "resolveCategoryIdByLabel");
-var MANUAL_ONLY_MERCHANT_PATTERNS = [
-  // Costco has no receipt-parsing pipeline yet (unlike Walmart/Amazon) — for
-  // now these just need to stay uncategorized/pending so the user always
-  // categorizes them by hand instead of getting a wrong auto-guess.
-  /costco/i
-];
+var MANUAL_ONLY_MERCHANT_PATTERNS = [];
 async function suggestCategoryId(env, merchant, rawText) {
   // Walmart/Amazon are categorized exclusively via the receipt-matching
   // pipeline (findMatchingTransaction / tryMatchUnclaimedReceipt), which only
@@ -621,7 +620,8 @@ async function insertCsvTransaction(env, ctx, transaction) {
     merchant: transaction.merchant,
     amount: transaction.amount,
     occurredAt: transaction.occurredAt,
-    status
+    status,
+    transactionType: transaction.transactionType
   });
   return transactionId;
 }
@@ -770,6 +770,12 @@ var index_default = {
       if (/^\/api\/receipts\/\d+\/match$/.test(url.pathname) && request.method === "POST") {
         return await handleMatchReceiptToTransaction(request, env, ctx, url.pathname.split("/")[3]);
       }
+      if (url.pathname === "/api/returns/candidates" && request.method === "GET") {
+        return await handleGetReturnCandidates(env, url.searchParams.get("merchant"), parseFloat(url.searchParams.get("amount")));
+      }
+      if (/^\/api\/returns\/\d+\/resolve$/.test(url.pathname) && request.method === "POST") {
+        return await handleResolveReturn(request, env, ctx, url.pathname.split("/")[3]);
+      }
       if (url.pathname === "/api/auto-categorizations" && request.method === "GET") {
         return await handleGetAutoCategorizationLog(env);
       }
@@ -842,6 +848,9 @@ var index_default = {
       if (/^\/api\/transactions\/\d+\/unsplit$/.test(url.pathname) && request.method === "POST") {
         return await handleUnsplitTransaction(request, env);
       }
+      if (/^\/api\/transactions\/\d+\/categorize-items$/.test(url.pathname) && request.method === "POST") {
+        return await handleCategorizeTransactionItems(request, env, url.pathname.split("/")[3]);
+      }
       if (url.pathname.startsWith("/api/transactions/") && request.method === "PATCH") {
         return await handleUpdateTransactionNotes(request, env);
       }
@@ -902,7 +911,7 @@ var index_default = {
       );
     }
     if (event.cron === "*/30 * * * *") {
-      ctx.waitUntil(processWalmartReceipts(env, ctx).catch((err) => console.error("Scheduled Walmart receipt check failed:", err)));
+      ctx.waitUntil(processInStoreReceipts(env, ctx).catch((err) => console.error("Scheduled in-store receipt check failed:", err)));
       ctx.waitUntil(processAmazonReceipts(env, ctx).catch((err) => console.error("Scheduled Amazon receipt check failed:", err)));
     }
   }
@@ -988,7 +997,8 @@ async function handleIncomingSms(request, env, ctx) {
     merchant: parsed.merchant,
     amount: parsed.amount,
     occurredAt: parsed.occurredAt,
-    status
+    status,
+    transactionType: parsed.transactionType
   });
   if (!receiptResult && status !== "categorized") {
     ctx.waitUntil(sendPushNotification(env, {
@@ -1200,7 +1210,8 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
         merchant,
         amount: Math.abs(amount),
         occurredAt,
-        status
+        status,
+        transactionType
       });
       if (!receiptResult && status !== "categorized") {
         ctx.waitUntil(sendPushNotification(env, {
@@ -1429,11 +1440,15 @@ async function gmailFetch(accessToken, path) {
   return data;
 }
 __name(gmailFetch, "gmailFetch");
-async function listUnprocessedWalmartReceiptEmails(accessToken) {
+// Catches every forwarded in-store receipt photo/PDF regardless of merchant
+// (Walmart, Target, Costco, ...) — there's no reliable Gmail-side signal to
+// bucket these by store, so the merchant is identified later by Claude from
+// the image itself (see parseAndCategorizeReceipt).
+async function listUnprocessedInStoreReceiptEmails(accessToken) {
   const data = await gmailFetch(accessToken, `/messages?q=${encodeURIComponent("has:attachment")}`);
   return (data.messages || []).map((m) => m.id);
 }
-__name(listUnprocessedWalmartReceiptEmails, "listUnprocessedWalmartReceiptEmails");
+__name(listUnprocessedInStoreReceiptEmails, "listUnprocessedInStoreReceiptEmails");
 async function fetchGmailMessage(accessToken, messageId) {
   return await gmailFetch(accessToken, `/messages/${messageId}?format=full`);
 }
@@ -1519,6 +1534,7 @@ var RECEIPT_SCHEMA = {
   type: "object",
   properties: {
     isReceipt: { type: "boolean", description: "False if this image/document is not actually a store receipt (e.g. an ad, promo banner, or unrelated attachment)" },
+    merchant: { type: "string", enum: ["walmart", "target", "costco", "amazon", "unknown"], description: "Which store this receipt is from, identified from its visual branding or text" },
     date: { type: "string", description: "Transaction date converted to strict ISO 8601 (YYYY-MM-DD), regardless of the format printed on the receipt" },
     subtotal: { type: "number" },
     taxTotal: { type: "number" },
@@ -1538,7 +1554,7 @@ var RECEIPT_SCHEMA = {
       }
     }
   },
-  required: ["isReceipt", "date", "subtotal", "taxTotal", "total", "items"],
+  required: ["isReceipt", "merchant", "date", "subtotal", "taxTotal", "total", "items"],
   additionalProperties: false
 };
 async function parseAndCategorizeReceipt(env, attachmentBytes, mimeType) {
@@ -1549,15 +1565,29 @@ async function parseAndCategorizeReceipt(env, attachmentBytes, mimeType) {
   const contentBlock = mimeType === "application/pdf"
     ? { type: "document", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } }
     : { type: "image", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } };
-  const prompt = `This email attachment is expected to be a photo/scan of a store receipt, but this inbox
-only ever receives forwarded receipts, so occasionally an unrelated ad or promo image slips in.
-First decide: is this actually a receipt? If not, set isReceipt to false and leave the other
+  const prompt = `This email attachment is expected to be a photo/scan of an in-store receipt, but this
+inbox only ever receives forwarded receipts, so occasionally an unrelated ad or promo image slips
+in. First decide: is this actually a receipt? If not, set isReceipt to false and leave the other
 fields as empty/zero placeholders — don't try to force-fit an ad into receipt fields.
 
-If it is a receipt: extract every purchased line item with its description and price, plus the
-subtotal, tax total, and grand total. Convert the date printed on the receipt (whatever format
-it's in, e.g. MM/DD/YY) to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
-lookups, so it must be a real, correctly converted calendar date, not the raw printed string.
+If it is a receipt, identify which store it's from using its visual branding and set "merchant"
+accordingly:
+- "walmart" — Walmart's usual blue/yellow branding and header.
+- "target" — Target's distinctive red bullseye logo (two concentric circles) and/or the word
+  "Target" printed on the receipt.
+- "costco" — the large "COSTCO" wordmark printed prominently near the top.
+- "unknown" — if it's a receipt but you can't confidently tell which of the above it is.
+
+Extract every purchased line item with its description and price, plus the subtotal, tax total,
+and grand total. Convert the date printed on the receipt (whatever format it's in, e.g. MM/DD/YY)
+to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database lookups, so it must be a
+real, correctly converted calendar date, not the raw printed string.
+
+Costco receipts commonly mark a sale/markdown as a separate line directly below the item it
+applies to, showing only a number string (e.g. an item/member number) and a negative dollar
+amount, with no description of its own. When you see this pattern, treat it as a discount on the
+item immediately above it: subtract it from that item's amount and emit only the single,
+discounted item — do not emit the discount as its own line item.
 
 Categorize each item into one of these existing budget categories when a reasonable match
 exists: ${categoryNames.join(", ")}.
@@ -1612,7 +1642,8 @@ unrelated forwarded email, etc.).
 
 First decide: does this email actually contain an Amazon order confirmation with purchased items
 and a grand total? If not, set isReceipt to false and leave the other fields as empty/zero
-placeholders — don't try to force-fit unrelated content into receipt fields.
+placeholders — don't try to force-fit unrelated content into receipt fields. If it is an order
+confirmation, set "merchant" to "amazon".
 
 If it is an order confirmation: extract every ordered line item with its description and price.
 Amazon order-confirmation emails typically show only a "Grand Total" with no separate subtotal or
@@ -1677,7 +1708,11 @@ var RECEIPT_SOURCES = {
     merchantLikePatterns: ["%walmart%", "%wal-mart%", "%wal mart%", "%wm supercenter%"],
     merchantRegex: /wal[\s-]?mart|wm\s*supercenter/i
   },
-  amazon: { merchantLikePatterns: ["%amazon%"], merchantRegex: /amazon/i }
+  amazon: { merchantLikePatterns: ["%amazon%"], merchantRegex: /amazon/i },
+  target: { merchantLikePatterns: ["%target%"], merchantRegex: /target/i },
+  // "POS COSTCO WHSE #0486..." is the raw terminal descriptor seen from CSV
+  // imports; "Costco" alone is what Plaid/SMS report.
+  costco: { merchantLikePatterns: ["%costco%", "%costco whse%"], merchantRegex: /costco/i }
 };
 function merchantLikeClause(source) {
   const patterns = RECEIPT_SOURCES[source]?.merchantLikePatterns || [`%${source}%`];
@@ -1789,17 +1824,11 @@ ${existing.notes}` : autoNote;
 }
 __name(appendAutoGeneratedNote, "appendAutoGeneratedNote");
 async function flagTransactionNeedsReceiptReview(env, transactionId, parsed) {
+  // The item-by-item breakdown is available live from receiptItems (see
+  // handleGetSingleTransaction) and rendered inline in the notes/categorize
+  // screen, so it doesn't need to be duplicated into the freeform notes
+  // field — that's reserved for whatever the user types themselves.
   const uncertainItems = summarizeReceiptItems(parsed.items.filter((i) => i.uncertain));
-  const confidentItems = summarizeReceiptItems(parsed.items.filter((i) => !i.uncertain));
-  const lines = [
-    "⚠️ Auto-flagged by receipt scan — needs manual categorization:",
-    ...uncertainItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} — $${i.amount.toFixed(2)} (uncertain: guessed "${i.category}")`)
-  ];
-  if (confidentItems.length) {
-    lines.push("Other items on this receipt (already looked confident):");
-    lines.push(...confidentItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} — $${i.amount.toFixed(2)} → ${i.category}`));
-  }
-  await appendAutoGeneratedNote(env, transactionId, lines.join("\n"));
   await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
   await env.DB.prepare(
     "UPDATE transactions SET is_split = 0, category_id = NULL, status = 'needs_review', categorized_at = NULL WHERE id = ?"
@@ -1807,23 +1836,21 @@ async function flagTransactionNeedsReceiptReview(env, transactionId, parsed) {
   return uncertainItems.map((i) => i.description).join(", ");
 }
 __name(flagTransactionNeedsReceiptReview, "flagTransactionNeedsReceiptReview");
-async function applyReceiptResult(env, transactionId, parsed, transactionAmount, { merchant, source } = {}) {
-  if (parsed.items.some((i) => i.uncertain)) {
-    const uncertainSummary = await flagTransactionNeedsReceiptReview(env, transactionId, parsed);
-    return { outcome: "needs_review", summary: `Needs review: ${uncertainSummary}` };
-  }
-  const labelToId = /* @__PURE__ */ new Map();
+// Groups items by resolved category, distributing tax proportionally to each
+// group's share of the subtotal, then corrects any rounding drift against
+// the largest group so the entries sum exactly to transactionAmount.
+// resolveCategoryId(item, index) may be async (e.g. looking up/creating a
+// category by label) or a plain synchronous lookup (e.g. a categoryId the
+// user already picked).
+async function computeCategorySplitEntries(items, subtotal, taxTotal, transactionAmount, resolveCategoryId) {
   const groupTotals = /* @__PURE__ */ new Map();
-  for (const item of parsed.items) {
-    let categoryId = labelToId.get(item.category);
-    if (categoryId === void 0) {
-      categoryId = await resolveCategoryIdByLabel(env, item.category);
-      labelToId.set(item.category, categoryId);
-    }
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const categoryId = await resolveCategoryId(item, i);
     groupTotals.set(categoryId, (groupTotals.get(categoryId) || 0) + item.amount);
   }
   const entries = [...groupTotals.entries()].map(([categoryId, groupSubtotal]) => {
-    const taxShare = parsed.subtotal > 0 ? parsed.taxTotal * (groupSubtotal / parsed.subtotal) : 0;
+    const taxShare = subtotal > 0 ? taxTotal * (groupSubtotal / subtotal) : 0;
     return { categoryId, amount: Math.round((groupSubtotal + taxShare) * 100) / 100 };
   });
   const sum = entries.reduce((s, e) => s + e.amount, 0);
@@ -1836,6 +1863,10 @@ async function applyReceiptResult(env, transactionId, parsed, transactionAmount,
   if (Math.abs(finalSum - transactionAmount) > 0.01) {
     throw new Error(`Split sum ${finalSum.toFixed(2)} doesn't match transaction amount ${transactionAmount.toFixed(2)}`);
   }
+  return entries;
+}
+__name(computeCategorySplitEntries, "computeCategorySplitEntries");
+async function applyCategorySplitEntries(env, transactionId, entries) {
   const now = (/* @__PURE__ */ new Date()).toISOString();
   await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
   if (entries.length === 1) {
@@ -1852,15 +1883,26 @@ async function applyReceiptResult(env, transactionId, parsed, transactionAmount,
       "UPDATE transactions SET is_split = 1, category_id = NULL, status = 'categorized', categorized_at = ? WHERE id = ?"
     ).bind(now, transactionId).run();
   }
+}
+__name(applyCategorySplitEntries, "applyCategorySplitEntries");
+async function applyReceiptResult(env, transactionId, parsed, transactionAmount, { merchant, source } = {}) {
+  if (parsed.items.some((i) => i.uncertain)) {
+    const uncertainSummary = await flagTransactionNeedsReceiptReview(env, transactionId, parsed);
+    return { outcome: "needs_review", summary: `Needs review: ${uncertainSummary}` };
+  }
+  const labelToId = /* @__PURE__ */ new Map();
+  const entries = await computeCategorySplitEntries(parsed.items, parsed.subtotal, parsed.taxTotal, transactionAmount, async (item) => {
+    let categoryId = labelToId.get(item.category);
+    if (categoryId === void 0) {
+      categoryId = await resolveCategoryIdByLabel(env, item.category);
+      labelToId.set(item.category, categoryId);
+    }
+    return categoryId;
+  });
+  await applyCategorySplitEntries(env, transactionId, entries);
   const groupedItems = summarizeReceiptItems(parsed.items);
   const itemLines = groupedItems.map((i) => `${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} ($${i.amount.toFixed(2)}) → ${i.category}`);
   const summary = itemLines.join(", ");
-  await appendAutoGeneratedNote(
-    env,
-    transactionId,
-    `🧾 Auto-categorized from receipt:
-${groupedItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} — $${i.amount.toFixed(2)} → ${i.category}`).join("\n")}`
-  );
   await recordAutoCategorization(env, {
     transactionId,
     merchant,
@@ -1873,7 +1915,7 @@ ${groupedItems.map((i) => `  • ${i.description}${i.quantity > 1 ? ` x${i.quant
   return { outcome: "matched", summary };
 }
 __name(applyReceiptResult, "applyReceiptResult");
-async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amount, occurredAt, status }) {
+async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amount, occurredAt, status, transactionType }) {
   // If the receipt for this Walmart charge was already emailed and parsed
   // before the bank transaction posted, apply that categorization now
   // instead of treating this as a fresh pending charge — avoids a
@@ -1883,6 +1925,11 @@ async function tryMatchUnclaimedReceipt(env, ctx, { transactionId, merchant, amo
   // above, leave that alone; the next receipt-check cron will notice the
   // transaction is no longer pending and discard the receipt as moot.
   if (status !== "pending") return null;
+  // A credit/deposit (e.g. a vendor return) should never be auto-matched
+  // against an unclaimed *purchase* receipt just because amount/date happen
+  // to coincide — that's a separate return-matching flow (see
+  // findReturnCandidates), not this one.
+  if (transactionType && transactionType !== "purchase") return null;
   const unclaimedReceipt = await findMatchingUnclaimedReceipt(env, merchant, amount, occurredAt);
   if (!unclaimedReceipt) return null;
   try {
@@ -1967,29 +2014,40 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
         summary.push({ messageId, status: "parse_error" });
         continue;
       }
-      const txn = await findMatchingTransaction(env, source, parsed.date, parsed.total);
+      // A single Gmail query (has:attachment) catches every in-store
+      // receipt regardless of merchant, so the actual merchant is only known
+      // once Claude has looked at the image — use that instead of the job's
+      // nominal source whenever it's a recognized one.
+      const effectiveSource = parsed.merchant && parsed.merchant !== "unknown" && RECEIPT_SOURCES[parsed.merchant]
+        ? parsed.merchant
+        : source;
+      const txn = await findMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
       if (!txn) {
         // No still-pending transaction to attach to. Distinguish "one exists
-        // but was already resolved by something else in the meantime" (the
-        // receipt is now moot — discard it) from "nothing has arrived yet"
-        // (keep parsed_json around so a later Plaid sync can claim it).
-        const alreadyResolved = await findAnyMatchingTransaction(env, source, parsed.date, parsed.total);
+        // but was already resolved by something else in the meantime" (a
+        // vendor/amount/date match was found, but that transaction is
+        // already categorized — keep parsed_json so the user can review the
+        // freshly-scanned items and decide whether to override it) from
+        // "nothing has arrived yet" (keep parsed_json around so a later
+        // Plaid sync can claim it).
+        const alreadyResolved = await findAnyMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
         if (alreadyResolved) {
           await recordProcessedReceiptEmail(env, {
             messageId,
-            source,
+            source: effectiveSource,
             status: "already_complete",
             receiptTotal: parsed.total,
             receiptDate: parsed.date,
+            parsedJson: parsed,
             matchedTransactionId: alreadyResolved.id,
-            detail: "Matching transaction was already categorized before this receipt was processed — discarded."
+            detail: "Matching transaction was already categorized before this receipt was processed — flagged for review."
           });
           summary.push({ messageId, status: "already_complete", transactionId: alreadyResolved.id });
           continue;
         }
         await recordProcessedReceiptEmail(env, {
           messageId,
-          source,
+          source: effectiveSource,
           status: "no_transaction_match",
           receiptTotal: parsed.total,
           receiptDate: parsed.date,
@@ -1998,10 +2056,10 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
         summary.push({ messageId, status: "no_transaction_match" });
         continue;
       }
-      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount, { merchant: txn.merchant, source });
+      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount, { merchant: txn.merchant, source: effectiveSource });
       await recordProcessedReceiptEmail(env, {
         messageId,
-        source,
+        source: effectiveSource,
         status: result.outcome,
         receiptTotal: parsed.total,
         receiptDate: parsed.date,
@@ -2029,9 +2087,12 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
   return { count: summary.length, results: summary };
 }
 __name(processReceiptEmails, "processReceiptEmails");
-async function processWalmartReceipts(env, ctx) {
+async function processInStoreReceipts(env, ctx) {
+  // "walmart" here is only the nominal job/bookkeeping source (used for the
+  // receipt_job_runs status row) — the actual per-email source is resolved
+  // from the parsed merchant inside processReceiptEmails.
   return processReceiptEmails(env, ctx, "walmart", {
-    listCandidateIds: listUnprocessedWalmartReceiptEmails,
+    listCandidateIds: listUnprocessedInStoreReceiptEmails,
     extractAndParse: async (accessToken, message) => {
       const part = findReceiptAttachmentPart(message.payload);
       if (!part) return { skip: true, status: "no_attachment" };
@@ -2041,7 +2102,7 @@ async function processWalmartReceipts(env, ctx) {
     }
   });
 }
-__name(processWalmartReceipts, "processWalmartReceipts");
+__name(processInStoreReceipts, "processInStoreReceipts");
 async function processAmazonReceipts(env, ctx) {
   return processReceiptEmails(env, ctx, "amazon", {
     listCandidateIds: listUnprocessedAmazonReceiptEmails,
@@ -2056,11 +2117,11 @@ async function processAmazonReceipts(env, ctx) {
 }
 __name(processAmazonReceipts, "processAmazonReceipts");
 async function runAllReceiptSources(env, ctx) {
-  const [walmart, amazon] = await Promise.all([
-    processWalmartReceipts(env, ctx),
+  const [inStore, amazon] = await Promise.all([
+    processInStoreReceipts(env, ctx),
     processAmazonReceipts(env, ctx)
   ]);
-  return { count: walmart.count + amazon.count, results: [...walmart.results, ...amazon.results] };
+  return { count: inStore.count + amazon.count, results: [...inStore.results, ...amazon.results] };
 }
 __name(runAllReceiptSources, "runAllReceiptSources");
 async function handleReceiptCheckNow(request, env, ctx) {
@@ -2084,9 +2145,14 @@ async function handleReceiptStatus(env) {
   const lastRunCount = runRows.some((r) => r.last_run_count != null)
     ? runRows.reduce((sum, r) => sum + (r.last_run_count || 0), 0)
     : null;
+  // 'no_transaction_match' = nothing to attach to yet; 'already_complete' =
+  // a vendor/amount/date match WAS found but that transaction was already
+  // categorized by something else — surface both so the user can either
+  // attach or review/override.
   const { results: unclaimed } = await env.DB.prepare(
-    `SELECT id, source, receipt_total, receipt_date, processed_at FROM processed_receipt_emails
-    WHERE status = 'no_transaction_match' ORDER BY processed_at DESC`
+    `SELECT id, source, receipt_total, receipt_date, processed_at, parsed_json, status, matched_transaction_id
+    FROM processed_receipt_emails
+    WHERE status IN ('no_transaction_match', 'already_complete') ORDER BY processed_at DESC`
   ).all();
   return jsonResponse({
     lastRunAt,
@@ -2139,6 +2205,122 @@ async function handleMatchReceiptToTransaction(request, env, ctx, receiptId) {
   return jsonResponse({ success: true, ...result });
 }
 __name(handleMatchReceiptToTransaction, "handleMatchReceiptToTransaction");
+var RETURN_MATCH_WINDOW_DAYS = 60;
+var RETURN_MATCH_TOLERANCE = 0.02;
+async function findReturnCandidates(env, source, sinceDate) {
+  const { results: receipts } = await env.DB.prepare(
+    `SELECT id, parsed_json, receipt_date, matched_transaction_id FROM processed_receipt_emails
+    WHERE source = ? AND matched_transaction_id IS NOT NULL AND receipt_date >= ?`
+  ).bind(source, sinceDate).all();
+  if (!receipts.length) return [];
+  const { results: claimed } = await env.DB.prepare(
+    "SELECT receipt_id, item_index FROM matched_returns"
+  ).all();
+  const claimedSet = new Set(claimed.map((c) => `${c.receipt_id}:${c.item_index}`));
+  const candidates = [];
+  for (const receipt of receipts) {
+    let parsed;
+    try {
+      parsed = JSON.parse(receipt.parsed_json);
+    } catch {
+      continue;
+    }
+    if (!parsed?.items?.length) continue;
+    // Receipts don't break out tax per line item, only a receipt-wide total
+    // — apply the same proportional tax rate to a single item that
+    // applyReceiptResult already applies per category group, so a returned
+    // item's expected refund amount includes its share of tax.
+    const taxRate = parsed.subtotal > 0 ? parsed.taxTotal / parsed.subtotal : 0;
+    parsed.items.forEach((item, itemIndex) => {
+      const key = `${receipt.id}:${itemIndex}`;
+      if (claimedSet.has(key)) return;
+      candidates.push({
+        candidateId: key,
+        description: item.description,
+        amount: Math.round(item.amount * (1 + taxRate) * 100) / 100,
+        category: item.category,
+        receiptDate: receipt.receipt_date,
+        purchaseTransactionId: receipt.matched_transaction_id
+      });
+    });
+  }
+  return candidates;
+}
+__name(findReturnCandidates, "findReturnCandidates");
+async function handleGetReturnCandidates(env, merchant, amount) {
+  const source = Object.entries(RECEIPT_SOURCES).find(([, cfg]) => cfg.merchantRegex.test(merchant || ""))?.[0];
+  if (!source) return jsonResponse({ supported: false });
+  const sinceDate = new Date(Date.now() - RETURN_MATCH_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const candidates = await findReturnCandidates(env, source, sinceDate);
+  const byCloseness = [...candidates].sort((a, b) => Math.abs(a.amount - amount) - Math.abs(b.amount - amount));
+  const suggestedCandidateId = byCloseness.length && Math.abs(byCloseness[0].amount - amount) <= RETURN_MATCH_TOLERANCE
+    ? byCloseness[0].candidateId
+    : null;
+  // Browsing order is most-recent-first; the suggestion flag (above) is
+  // independent of this display order.
+  candidates.sort((a, b) => (a.receiptDate < b.receiptDate ? 1 : -1));
+  return jsonResponse({ supported: true, candidates, suggestedCandidateId });
+}
+__name(handleGetReturnCandidates, "handleGetReturnCandidates");
+async function handleResolveReturn(request, env, ctx, transactionId) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { candidateId, categoryId: directCategoryId } = body;
+  if (!candidateId && !directCategoryId) return jsonResponse({ error: "candidateId or categoryId is required" }, 400);
+  if (!candidateId) {
+    // No itemized data for this vendor — just net the credit against a
+    // category the user picked directly, same mechanism, no item lookup.
+    const txn = await env.DB.prepare("SELECT * FROM transactions WHERE id = ?").bind(transactionId).first();
+    if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const netAmount = -Math.abs(txn.amount);
+    await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare(
+      `UPDATE transactions SET amount = ?, transaction_type = 'purchase', status = 'categorized', category_id = ?, is_split = 0, categorized_at = ? WHERE id = ?`
+    ).bind(netAmount, directCategoryId, now, transactionId).run();
+    await appendAutoGeneratedNote(
+      env,
+      transactionId,
+      `🔁 Marked as a return ($${Math.abs(txn.amount).toFixed(2)}) — removed from category manually (no itemized receipt available)`
+    );
+    return jsonResponse({ success: true, categoryId: directCategoryId, amount: netAmount });
+  }
+  const [receiptIdStr, itemIndexStr] = candidateId.split(":");
+  const receiptId = Number(receiptIdStr);
+  const itemIndex = Number(itemIndexStr);
+  const alreadyClaimed = await env.DB.prepare(
+    "SELECT id FROM matched_returns WHERE receipt_id = ? AND item_index = ?"
+  ).bind(receiptId, itemIndex).first();
+  if (alreadyClaimed) return jsonResponse({ error: "That item has already been matched to a different return" }, 409);
+  const receipt = await env.DB.prepare("SELECT * FROM processed_receipt_emails WHERE id = ?").bind(receiptId).first();
+  if (!receipt || !receipt.parsed_json) return jsonResponse({ error: "Receipt not found" }, 404);
+  const parsed = JSON.parse(receipt.parsed_json);
+  const item = parsed.items?.[itemIndex];
+  if (!item) return jsonResponse({ error: "Item not found on receipt" }, 404);
+  const txn = await env.DB.prepare("SELECT * FROM transactions WHERE id = ?").bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  const categoryId = await resolveCategoryIdByLabel(env, item.category);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const netAmount = -Math.abs(txn.amount);
+  await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+  await env.DB.prepare(
+    `UPDATE transactions SET amount = ?, transaction_type = 'purchase', status = 'categorized', category_id = ?, is_split = 0, categorized_at = ? WHERE id = ?`
+  ).bind(netAmount, categoryId, now, transactionId).run();
+  await env.DB.prepare(
+    "INSERT INTO matched_returns (receipt_id, item_index, return_transaction_id) VALUES (?, ?, ?)"
+  ).bind(receiptId, itemIndex, transactionId).run();
+  await appendAutoGeneratedNote(
+    env,
+    transactionId,
+    `🔁 Matched as return: ${item.description} ($${Math.abs(txn.amount).toFixed(2)}), originally purchased ${receipt.receipt_date} → removed from ${item.category}`
+  );
+  return jsonResponse({ success: true, categoryId, amount: netAmount });
+}
+__name(handleResolveReturn, "handleResolveReturn");
 __name(handleReceiptCheckNow, "handleReceiptCheckNow");
 async function handleGetAutoCategorizationLog(env) {
   const { results } = await env.DB.prepare(
@@ -2957,6 +3139,25 @@ async function handleGetSingleTransaction(env, transactionId) {
   ).bind(transactionId).first();
   if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
   const [withSplits] = await attachSplits(env, [txn]);
+  // A receipt (matched, needs_review, or already_complete/flagged-for-review)
+  // is always offered as a manual per-item recategorization option, even
+  // when the transaction was already confidently auto-categorized.
+  const receipt = await env.DB.prepare(
+    "SELECT parsed_json, source FROM processed_receipt_emails WHERE matched_transaction_id = ? ORDER BY id DESC LIMIT 1"
+  ).bind(transactionId).first();
+  if (receipt && receipt.parsed_json) {
+    const parsed = JSON.parse(receipt.parsed_json);
+    const { results: categories } = await env.DB.prepare("SELECT id, name FROM categories WHERE is_active = 1").all();
+    const nameToId = new Map(categories.map((c) => [c.name.toLowerCase(), c.id]));
+    withSplits.receiptItems = parsed.items.map((item) => ({
+      description: item.description,
+      amount: item.amount,
+      category: item.category,
+      categoryId: nameToId.get((item.category || "").toLowerCase()) || null,
+      uncertain: item.uncertain
+    }));
+    withSplits.receiptSource = receipt.source;
+  }
   return jsonResponse(withSplits);
 }
 __name(handleGetSingleTransaction, "handleGetSingleTransaction");
@@ -3057,6 +3258,60 @@ async function handleSplitTransaction(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleSplitTransaction, "handleSplitTransaction");
+// Manual per-item recategorization: the user picks a category for each
+// receipt line item (dropdowns pre-filled with what was parsed/suggested),
+// rather than retyping dollar-amount splits. Reuses the same
+// group-by-category + proportional-tax-share logic the automatic receipt
+// pipeline uses, just with user-chosen categoryIds instead of resolved
+// labels.
+async function handleCategorizeTransactionItems(request, env, transactionId) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { categoryIds } = body;
+  if (!Array.isArray(categoryIds) || !categoryIds.length) {
+    return jsonResponse({ error: "categoryIds array is required" }, 400);
+  }
+  const txn = await env.DB.prepare("SELECT * FROM transactions WHERE id = ?").bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  const receipt = await env.DB.prepare(
+    "SELECT * FROM processed_receipt_emails WHERE matched_transaction_id = ? ORDER BY id DESC LIMIT 1"
+  ).bind(transactionId).first();
+  if (!receipt || !receipt.parsed_json) return jsonResponse({ error: "No receipt items found for this transaction" }, 404);
+  const parsed = JSON.parse(receipt.parsed_json);
+  if (categoryIds.length !== parsed.items.length) {
+    return jsonResponse({ error: "categoryIds length must match item count" }, 400);
+  }
+  const { results: categories } = await env.DB.prepare("SELECT id, name FROM categories WHERE is_active = 1").all();
+  const idToName = new Map(categories.map((c) => [c.id, c.name]));
+  for (const id of categoryIds) {
+    if (!idToName.has(Number(id))) return jsonResponse({ error: `Invalid categoryId ${id}` }, 400);
+  }
+  const updatedItems = parsed.items.map((item, idx) => ({
+    ...item,
+    category: idToName.get(Number(categoryIds[idx])),
+    uncertain: false
+  }));
+  const entries = await computeCategorySplitEntries(
+    updatedItems,
+    parsed.subtotal,
+    parsed.taxTotal,
+    txn.amount,
+    async (item, idx) => Number(categoryIds[idx])
+  );
+  await applyCategorySplitEntries(env, transactionId, entries);
+  const groupedItems = summarizeReceiptItems(updatedItems);
+  const summary = groupedItems.map((i) => `${i.description}${i.quantity > 1 ? ` x${i.quantity}` : ""} ($${i.amount.toFixed(2)}) → ${i.category}`).join(", ");
+  const updatedParsed = { ...parsed, items: updatedItems };
+  await env.DB.prepare(
+    "UPDATE processed_receipt_emails SET parsed_json = ?, status = 'matched', detail = ? WHERE id = ?"
+  ).bind(JSON.stringify(updatedParsed), `Manually re-categorized: ${summary}`, receipt.id).run();
+  return jsonResponse({ success: true, entries, summary });
+}
+__name(handleCategorizeTransactionItems, "handleCategorizeTransactionItems");
 async function handleUnsplitTransaction(request, env) {
   const parts = new URL(request.url).pathname.split("/");
   const transactionId = parts[parts.length - 2];

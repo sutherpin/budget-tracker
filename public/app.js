@@ -1,10 +1,38 @@
 const API = location.origin;
 
-// Pending Walmart/Amazon charges get auto-categorized from a matched receipt
-// within ~30 min (see the receipt-check cron) — flag them so the user doesn't
-// jump in and categorize manually while that's still in flight.
+// Pending Walmart/Amazon/Target/Costco charges get auto-categorized from a
+// matched receipt within ~30 min (see the receipt-check cron) — flag them so
+// the user doesn't jump in and categorize manually while that's still in
+// flight.
+function isReturnTrackedVendor(merchant) {
+  return /wal[\s-]?mart|wm\s*supercenter|amazon|target|costco/i.test(merchant || '');
+}
+
+const RECEIPT_MERCHANT_LABELS = {
+  walmart: 'Walmart',
+  amazon: 'Amazon',
+  target: 'Target',
+  costco: 'Costco',
+};
+
+function receiptMerchantLabel(source) {
+  return RECEIPT_MERCHANT_LABELS[source] || 'Receipt';
+}
+
+// A 'deposit'-typed transaction is any credit — paycheck, internal transfer,
+// interest, a card payment posting, or an actual vendor return. Only the
+// last one should trigger the return-matching flow; exclude merchant
+// strings that look like the generic bank-deposit language already used
+// server-side to classify these as credits in the first place (see
+// parseTransactionFromCSV / syncPlaidTransactions).
+const GENERIC_DEPOSIT_PATTERN = /deposit|transfer|payroll|salary|interest|credit\s*card|e-?payment|auto\s*pay|card\s*pymt|\bxfr\b|pymnt/i;
+
+function looksLikeVendorReturn(txn) {
+  return txn.transaction_type === 'deposit' && !GENERIC_DEPOSIT_PATTERN.test(txn.merchant || '');
+}
+
 function awaitingReceiptBadgeHtml(txn) {
-  if (txn.status !== 'pending' || !/wal[\s-]?mart|wm\s*supercenter|amazon/i.test(txn.merchant || '')) return '';
+  if (txn.status !== 'pending' || txn.transaction_type === 'deposit' || !isReturnTrackedVendor(txn.merchant)) return '';
   return ' <span class="awaiting-receipt-badge">awaiting receipt</span>';
 }
 
@@ -18,6 +46,7 @@ let state = {
   csvDuplicates: [],
   currentTxn: null,
   currentSplitTxn: null,
+  currentReturnTxn: null,
   currentCategoryDetailId: null,
   currentMonth: new Date().toISOString().slice(0, 7),
 };
@@ -147,6 +176,8 @@ window.addEventListener('DOMContentLoaded', async () => {
       closeMatchReceiptModal();
     } else if (!document.getElementById('modal-csv-duplicates')?.classList.contains('hidden')) {
       closeCsvDuplicatesModal();
+    } else if (!document.getElementById('modal-return-match')?.classList.contains('hidden')) {
+      closeReturnMatchModal();
     } else if (!document.getElementById('modal-category-detail')?.classList.contains('hidden')) {
       closeCategoryDetail();
     }
@@ -204,6 +235,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-close-csv-duplicates')?.addEventListener('click', closeCsvDuplicatesModal);
   document.getElementById('modal-csv-duplicates')?.addEventListener('click', (e) => {
     if (e.target.id === 'modal-csv-duplicates') closeCsvDuplicatesModal();
+  });
+
+  // Add event listeners for the return/refund match modal
+  document.getElementById('btn-close-return-match')?.addEventListener('click', closeReturnMatchModal);
+  document.getElementById('modal-return-match')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-return-match') closeReturnMatchModal();
   });
 
   document.getElementById('btn-sync-plaid')?.addEventListener('click', syncPlaidNow);
@@ -390,8 +427,7 @@ function updateAutoLogBadge(count) {
 
 function autoLogMethodLabel(entry) {
   if (entry.method === 'receipt') {
-    const merchantLabel = entry.source === 'amazon' ? 'Amazon' : entry.source === 'walmart' ? 'Walmart' : 'Receipt';
-    return `🧾 ${merchantLabel} receipt`;
+    return `🧾 ${receiptMerchantLabel(entry.source)} receipt`;
   }
   if (entry.method === 'merchant_map') return '🔁 remembered merchant';
   if (entry.method === 'auto_label') return '🏷️ auto-detected';
@@ -541,6 +577,24 @@ function renderReceiptStatusText(data) {
   textEl.textContent = `🧾 Checked ${formatRelativeTime(data.lastRunAt)}${foundText} · ${nextText}`;
 }
 
+// Builds the same "header line + bullet lines" text shape that
+// renderReceiptItemsNote() already knows how to render, from a receipt's raw
+// parsed_json — lets the unclaimed-receipt list and match modal show what
+// was actually scanned, to help pick the right transaction to attach to.
+function receiptItemsNoteText(receipt) {
+  if (!receipt.parsed_json) return '';
+  let parsed;
+  try {
+    parsed = JSON.parse(receipt.parsed_json);
+  } catch {
+    return '';
+  }
+  if (!parsed.items || !parsed.items.length) return '';
+  const merchantLabel = receiptMerchantLabel(receipt.source);
+  const lines = parsed.items.map((i) => `• ${i.description} — ${fmt(i.amount)} (${i.category})`);
+  return [`${merchantLabel} items:`, ...lines].join('\n');
+}
+
 function renderUnclaimedReceipts(receipts) {
   const listEl = document.getElementById('unclaimed-receipts-list');
   if (!listEl) return;
@@ -553,13 +607,26 @@ function renderUnclaimedReceipts(receipts) {
   listEl.innerHTML = '';
   receipts.forEach((r) => {
     const row = document.createElement('div');
-    row.className = 'unclaimed-receipt-row unclaimed-receipt-row-clickable';
+    const isConflict = r.status === 'already_complete';
+    row.className = `unclaimed-receipt-row unclaimed-receipt-row-clickable${isConflict ? ' unclaimed-receipt-row-conflict' : ''}`;
+    const merchantLabel = receiptMerchantLabel(r.source);
+    const icon = isConflict ? '⚠️' : '🧾';
+    const message = isConflict
+      ? `${merchantLabel} receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — a matching transaction was already categorized (tap to review & re-categorize)`
+      : `${merchantLabel} receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — waiting for the bank to report this transaction (tap to attach manually)`;
     row.innerHTML = `
-      <span class="unclaimed-receipt-icon">🧾</span>
-      <span class="unclaimed-receipt-text">Receipt for ${fmt(r.receipt_total)} on ${formatDate(r.receipt_date)} — waiting for the bank to report this transaction (tap to attach manually)</span>
+      <span class="unclaimed-receipt-icon">${icon}</span>
+      <span class="unclaimed-receipt-text">${message}</span>
     `;
     row.addEventListener('click', () => openMatchReceiptModal(r));
     listEl.appendChild(row);
+    const itemsText = receiptItemsNoteText(r);
+    if (itemsText) {
+      const itemsEl = document.createElement('div');
+      itemsEl.className = 'split-receipt-items transaction-notes';
+      renderReceiptItemsNote(itemsEl, itemsText);
+      listEl.appendChild(itemsEl);
+    }
   });
 }
 
@@ -568,7 +635,12 @@ function renderUnclaimedReceipts(receipts) {
 // ============================================================
 
 async function openMatchReceiptModal(receipt) {
-  document.getElementById('match-receipt-label').textContent = `Attach $${receipt.receipt_total.toFixed(2)} receipt (${formatDate(receipt.receipt_date)}) to:`;
+  const merchantLabel = receiptMerchantLabel(receipt.source);
+  const labelText = receipt.status === 'already_complete'
+    ? `$${receipt.receipt_total.toFixed(2)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) already matched a categorized transaction — re-categorize to:`
+    : `Attach $${receipt.receipt_total.toFixed(2)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) to:`;
+  document.getElementById('match-receipt-label').textContent = labelText;
+  renderReceiptItemsNote(document.getElementById('match-receipt-items'), receiptItemsNoteText(receipt));
   const listEl = document.getElementById('match-receipt-candidates');
   listEl.innerHTML = '<div class="empty-state">Loading…</div>';
   document.getElementById('modal-match-receipt').classList.remove('hidden');
@@ -622,6 +694,141 @@ async function matchReceiptToTransaction(receiptId, transactionId) {
 
 function closeMatchReceiptModal() {
   document.getElementById('modal-match-receipt').classList.add('hidden');
+}
+
+// ============================================================
+// Return/Refund Match Modal
+// ============================================================
+
+async function openReturnMatchModal(txn) {
+  state.currentReturnTxn = txn;
+  document.getElementById('return-match-label').textContent = `${txn.merchant} credited $${txn.amount.toFixed(2)} on ${formatDate(txn.occurred_at)} — what was returned?`;
+  const suggestedEl = document.getElementById('return-match-suggested');
+  const listEl = document.getElementById('return-match-candidates');
+  suggestedEl.innerHTML = '';
+  suggestedEl.classList.add('hidden');
+  listEl.innerHTML = '<div class="empty-state">Loading…</div>';
+  document.getElementById('modal-return-match').classList.remove('hidden');
+
+  let data;
+  try {
+    data = await apiFetch(`/api/returns/candidates?merchant=${encodeURIComponent(txn.merchant || '')}&amount=${txn.amount}`);
+  } catch (err) {
+    console.error('Failed to load return candidates:', err);
+    listEl.innerHTML = '<div class="empty-state">Failed to load candidate items</div>';
+    return;
+  }
+
+  if (!data.supported) {
+    renderReturnCategoryPicker("This vendor doesn't have itemized receipt history yet — pick a category to remove this amount from:");
+    return;
+  }
+
+  const suggested = data.candidates.find((c) => c.candidateId === data.suggestedCandidateId);
+  const rest = data.candidates.filter((c) => c.candidateId !== data.suggestedCandidateId);
+
+  if (suggested) {
+    suggestedEl.classList.remove('hidden');
+    suggestedEl.innerHTML = `
+      <div class="modal-label">Suggested match</div>
+      <div class="duplicate-pair auto-log-row" id="return-suggested-row">
+        <div class="duplicate-txn">
+          <div class="duplicate-txn-info">
+            <div class="duplicate-txn-merchant">${suggested.description}</div>
+            <div class="duplicate-txn-meta">${formatDate(suggested.receiptDate)} · ${suggested.category}</div>
+          </div>
+          <div class="duplicate-txn-right">
+            <div class="duplicate-txn-amount">${fmt(suggested.amount)}</div>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="btn-save-notes" id="btn-confirm-return-match">Confirm this match</button>
+    `;
+    document.getElementById('btn-confirm-return-match').addEventListener('click', () => confirmReturnMatch(suggested.candidateId));
+  }
+
+  if (!data.candidates.length) {
+    renderReturnCategoryPicker(`No itemized purchases found from ${txn.merchant} in the last 60 days — pick a category to remove this amount from:`);
+    return;
+  }
+
+  listEl.innerHTML = rest.length ? '<div class="modal-label">Not this one? Pick the actual item:</div>' : '';
+  rest.forEach((c) => {
+    const row = document.createElement('div');
+    row.className = 'duplicate-pair auto-log-row';
+    row.innerHTML = `
+      <div class="duplicate-txn">
+        <div class="duplicate-txn-info">
+          <div class="duplicate-txn-merchant">${c.description}</div>
+          <div class="duplicate-txn-meta">${formatDate(c.receiptDate)} · ${c.category}</div>
+        </div>
+        <div class="duplicate-txn-right">
+          <div class="duplicate-txn-amount">${fmt(c.amount)}</div>
+        </div>
+      </div>
+    `;
+    row.addEventListener('click', () => confirmReturnMatch(c.candidateId));
+    listEl.appendChild(row);
+  });
+}
+
+async function confirmReturnMatch(candidateId) {
+  if (!state.currentReturnTxn) return;
+  try {
+    await apiFetch(`/api/returns/${state.currentReturnTxn.id}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidateId }),
+    });
+    closeReturnMatchModal();
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    console.error('Resolve return failed:', err);
+    alert(`Failed to match return: ${err.message}`);
+  }
+}
+
+function closeReturnMatchModal() {
+  document.getElementById('modal-return-match').classList.add('hidden');
+  state.currentReturnTxn = null;
+}
+
+// Fallback for vendors with no itemized receipt history (e.g. Target): skip
+// item-matching entirely and just let the user pick which category this
+// credit should be removed from — same negative-amount mechanism underneath.
+function renderReturnCategoryPicker(message) {
+  const suggestedEl = document.getElementById('return-match-suggested');
+  const listEl = document.getElementById('return-match-candidates');
+  listEl.innerHTML = '';
+  suggestedEl.classList.remove('hidden');
+  suggestedEl.innerHTML = `
+    <div class="empty-state">${message}</div>
+    <div class="modal-cats" id="return-category-picker"></div>
+  `;
+  const picker = document.getElementById('return-category-picker');
+  state.categories.forEach((cat) => {
+    const btn = document.createElement('button');
+    btn.className = 'modal-cat-btn';
+    btn.innerHTML = `<span class="modal-cat-icon">${cat.icon}</span>${cat.name}`;
+    btn.addEventListener('click', () => confirmReturnCategoryOnly(cat.id));
+    picker.appendChild(btn);
+  });
+}
+
+async function confirmReturnCategoryOnly(categoryId) {
+  if (!state.currentReturnTxn) return;
+  try {
+    await apiFetch(`/api/returns/${state.currentReturnTxn.id}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ categoryId }),
+    });
+    closeReturnMatchModal();
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    console.error('Resolve return failed:', err);
+    alert(`Failed to match return: ${err.message}`);
+  }
 }
 
 async function loadReceiptStatus() {
@@ -1217,28 +1424,20 @@ function renderCategoryDetailList(transactions) {
   listEl.innerHTML = '';
   transactions.forEach((txn) => {
     const item = document.createElement('div');
-    item.className = 'transaction-item';
+    item.className = 'transaction-item transaction-item-clickable';
     item.innerHTML = `
       <div class="transaction-info">
-        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
+        <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
         ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
       </div>
       <div class="transaction-amount">${fmt(txn.amount)}</div>
-      <button class="btn-edit-notes" data-txn-id="${txn.id}">📝</button>
       <button class="btn-delete-txn" data-txn-id="${txn.id}">🗑️</button>
     `;
+    item.addEventListener('click', () => openNotesModal(txn));
     listEl.appendChild(item);
   });
 
-  listEl.querySelectorAll('.btn-edit-notes').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const transactionId = btn.dataset.txnId;
-      const transaction = transactions.find((t) => t.id == transactionId);
-      openNotesModal(transaction);
-    });
-  });
   listEl.querySelectorAll('.btn-delete-txn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1300,21 +1499,27 @@ function renderPending(transactions) {
   }
   list.innerHTML = '';
   transactions.forEach((txn) => {
-    const isReceiptFlagged = txn.status === 'needs_review' && txn.notes && txn.notes.startsWith('⚠️ Auto-flagged by receipt scan');
+    // status = 'needs_review' is only ever set by the receipt-scan pipeline
+    // (see flagTransactionNeedsReceiptReview), so it's a reliable signal on
+    // its own that this transaction has receipt items to review.
+    const isReceiptFlagged = txn.status === 'needs_review';
+    const isLikelyReturn = looksLikeVendorReturn(txn);
     const card = document.createElement('div');
     card.className = 'pending-card';
     card.innerHTML = `
       <div class="pending-info">
-        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
+        <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="pending-date">${formatDate(txn.occurred_at)}</div>
-        ${isReceiptFlagged ? '<div class="pending-receipt-hint">🧾 tap to review items &amp; split</div>' : ''}
+        ${isReceiptFlagged ? '<div class="pending-receipt-hint">🧾 tap to review items &amp; categorize</div>' : ''}
+        ${isLikelyReturn ? '<div class="pending-receipt-hint">🔁 tap to match this return</div>' : ''}
       </div>
       <div class="pending-amount">${fmt(txn.amount)}</div>
     `;
     card.addEventListener('click', () => {
       if (isReceiptFlagged) {
-        state.currentTxn = txn;
-        openSplitModal();
+        openNotesModal(txn);
+      } else if (isLikelyReturn) {
+        openReturnMatchModal(txn);
       } else {
         openCategorizeModal(txn);
       }
@@ -1922,15 +2127,14 @@ function renderTransactions(transactions) {
   list.innerHTML = '';
   transactions.forEach((txn) => {
       const item = document.createElement('div');
-      item.className = 'transaction-item';
+      item.className = 'transaction-item transaction-item-clickable';
       item.innerHTML = `
         <div class="transaction-info">
-          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
+          <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
           <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
           ${txn.notes ? `<div class="transaction-notes">${txn.notes}</div>` : ''}
         </div>
         <div class="transaction-amount">${fmt(txn.amount)}</div>
-        <button class="btn-edit-notes" data-txn-id="${txn.id}">📝</button>
         <button class="btn-delete-txn" data-txn-id="${txn.id}">🗑️</button>
       `;
 
@@ -1951,17 +2155,8 @@ function renderTransactions(transactions) {
       item.querySelector('.transaction-info').appendChild(categoryInfo);
     }
 
+    item.addEventListener('click', () => openNotesModal(txn));
     list.appendChild(item);
-  });
-
-  // Add event listeners for edit notes buttons
-  document.querySelectorAll('.btn-edit-notes').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const transactionId = btn.dataset.txnId;
-      const transaction = transactions.find(t => t.id == transactionId);
-      openNotesModal(transaction);
-    });
   });
 
   // Add event listeners for delete buttons
@@ -2044,37 +2239,44 @@ function restoreCategoryDetailModalIfNeeded() {
   }
 }
 
-function openNotesModal(transaction) {
-  state.currentTxn = transaction;
+async function openNotesModal(transaction) {
   // If this was opened from the category-detail modal, hide it underneath
-  // so it can't stack on top of the notes/split modals (both are visible
-  // via .hidden toggling only, so DOM order otherwise decides who wins).
+  // so it can't stack on top of the notes modal (both are visible via
+  // .hidden toggling only, so DOM order otherwise decides who wins).
   hideCategoryDetailModal();
   const modal = document.getElementById('modal-notes');
   document.getElementById('notes-merchant').textContent = transaction.merchant || 'Unknown merchant';
   document.getElementById('notes-amount').textContent = fmt(transaction.amount);
   document.getElementById('notes-date').textContent = formatDate(transaction.occurred_at);
   document.getElementById('notes-input').value = transaction.notes || '';
+  modal.classList.remove('hidden');
 
-  // Populate category dropdown
-  const categorySelect = document.getElementById('notes-category');
-  categorySelect.innerHTML = '<option value="">No category</option>';
+  // Callers only ever have a partial transaction (list views don't include
+  // receiptItems), so re-fetch the full record to know whether this is a
+  // receipt-backed transaction before deciding which editor to show.
+  let txn = transaction;
+  try {
+    txn = await apiFetch(`/api/transactions/${transaction.id}`);
+  } catch (err) {
+    console.error('Failed to load full transaction for notes:', err);
+  }
+  state.currentTxn = txn;
+  document.getElementById('notes-input').value = txn.notes || '';
 
-  state.categories.forEach((cat) => {
-    const option = document.createElement('option');
-    option.value = cat.id;
-    option.textContent = `${cat.icon} ${cat.name}`;
-    categorySelect.appendChild(option);
-  });
-
-  // Set current category if transaction has one
-  if (transaction.category_id) {
-    categorySelect.value = transaction.category_id;
-  } else {
-    categorySelect.value = '';
+  if (txn.receiptItems && txn.receiptItems.length) {
+    document.getElementById('notes-category-editor').classList.add('hidden');
+    document.getElementById('notes-items-editor').classList.remove('hidden');
+    renderItemCategoryRows(document.getElementById('notes-item-rows'), txn.receiptItems);
+    return;
   }
 
-  modal.classList.remove('hidden');
+  document.getElementById('notes-items-editor').classList.add('hidden');
+  document.getElementById('notes-category-editor').classList.remove('hidden');
+
+  const categorySelect = document.getElementById('notes-category');
+  categorySelect.innerHTML = '<option value="">No category</option>' +
+    state.categories.map((cat) => `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`).join('');
+  categorySelect.value = txn.category_id || '';
 }
 
 // ============================================================
@@ -2109,13 +2311,14 @@ async function openSplitModal() {
   const transactionId = state.currentTxn.id;
 
   // Close the notes modal and show the split modal immediately so there's
-  // no dead gap while the transaction details are fetched.
+  // no dead gap while the transaction details are fetched. Only reachable
+  // for transactions with no receipt attached — receipt-backed transactions
+  // categorize items inline in the notes modal instead (see openNotesModal).
   closeNotesModal();
   document.getElementById('split-merchant').textContent = 'Loading…';
   document.getElementById('split-total').textContent = '';
   document.getElementById('split-rows').innerHTML = '';
   document.getElementById('split-remaining').textContent = '';
-  document.getElementById('split-receipt-items').classList.add('hidden');
   document.getElementById('modal-split').classList.remove('hidden');
 
   let txn;
@@ -2131,8 +2334,6 @@ async function openSplitModal() {
   document.getElementById('split-merchant').textContent = txn.merchant || 'Unknown merchant';
   document.getElementById('split-total').textContent = fmt(txn.amount);
 
-  renderReceiptItemsNote(document.getElementById('split-receipt-items'), txn.notes);
-
   const initialRows = txn.is_split && txn.splits?.length
     ? txn.splits.map((s) => ({ categoryId: s.categoryId, amount: s.amount }))
     : [{ categoryId: '', amount: '' }, { categoryId: '', amount: '' }];
@@ -2143,6 +2344,29 @@ async function openSplitModal() {
   singleCategorySelect.innerHTML = '<option value="">Choose category</option>' +
     state.categories.map((cat) => `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`).join('');
   singleCategorySelect.value = !txn.is_split && txn.category_id ? txn.category_id : '';
+}
+
+// Renders one row per receipt item with a category dropdown pre-filled from
+// the parsed/suggested category — used inline in the notes modal for any
+// receipt-backed transaction, so a manual re-categorization is always just
+// as available as the original auto-categorized guess.
+function renderItemCategoryRows(containerEl, items) {
+  containerEl.innerHTML = '';
+  const categoryOptions = state.categories.map((cat) => `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`).join('');
+  items.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = 'split-item-row';
+    row.innerHTML = `
+      <span class="split-item-desc">${item.description}${item.uncertain ? ' <span class="split-item-uncertain" title="Low-confidence guess">⚠️</span>' : ''}</span>
+      <span class="split-item-amount">${fmt(item.amount)}</span>
+      <select class="split-item-category">
+        <option value="">Choose category</option>
+        ${categoryOptions}
+      </select>
+    `;
+    row.querySelector('select').value = item.categoryId || '';
+    containerEl.appendChild(row);
+  });
 }
 
 async function categorizeSplitAsSingleCategory() {
@@ -2255,31 +2479,51 @@ function closeNotesModal() {
 
 async function saveNotes() {
   const notes = document.getElementById('notes-input').value.trim();
-  const categoryId = document.getElementById('notes-category').value;
   const transactionId = state.currentTxn.id;
-
-  console.log(`Attempting to save notes and category for transaction ${transactionId}:`, { notes, categoryId });
+  const isReceiptBacked = state.currentTxn.receiptItems && state.currentTxn.receiptItems.length;
 
   try {
-    console.log('Calling apiFetch...');
-    const response = await apiFetch(`/api/transactions/${transactionId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        notes: notes,
-        categoryId: categoryId || null // Send null if no category selected
-      }),
-    });
+    if (isReceiptBacked) {
+      const selects = [...document.querySelectorAll('#notes-item-rows .split-item-category')];
+      const categoryIds = [];
+      for (const sel of selects) {
+        if (!sel.value) {
+          alert('Choose a category for every item');
+          return;
+        }
+        categoryIds.push(Number(sel.value));
+      }
+      await apiFetch(`/api/transactions/${transactionId}/categorize-items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categoryIds }),
+      });
+      await apiFetch(`/api/transactions/${transactionId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes }),
+      });
+    } else {
+      const categoryId = document.getElementById('notes-category').value;
+      await apiFetch(`/api/transactions/${transactionId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          notes: notes,
+          categoryId: categoryId || null // Send null if no category selected
+        }),
+      });
+    }
 
-    console.log('Notes and category saved successfully, response:', response);
     closeNotesModal();
+    restoreCategoryDetailModalIfNeeded();
     await refreshAfterTransactionChange();
 
     const btn = document.getElementById('btn-save-notes');
     btn.textContent = 'Saved ✓';
     btn.style.background = '#22c55e';
     setTimeout(() => {
-      btn.textContent = 'Save Notes';
+      btn.textContent = 'Save';
       btn.style.background = '';
     }, 1500);
   } catch (err) {
