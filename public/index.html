@@ -47,25 +47,25 @@
 
       <div class="account-balance-bar">
         <div class="account-balance hidden" id="account-balance">
-          <div class="account-balance-row">
-            <div class="account-balance-item">
-              <span class="account-balance-label">Checking</span>
-              <span class="account-balance-amount" id="account-balance-checking">$0</span>
-            </div>
-            <div class="account-balance-item">
-              <span class="account-balance-label">Savings</span>
-              <span class="account-balance-amount" id="account-balance-savings">$0</span>
-            </div>
+          <div class="account-balance-item">
+            <span class="account-balance-label">Checking</span>
+            <span class="account-balance-amount" id="account-balance-checking">$0</span>
           </div>
-          <div class="account-balance-note" id="account-balance-note"></div>
+          <div class="account-balance-item">
+            <span class="account-balance-label">Savings</span>
+            <span class="account-balance-amount" id="account-balance-savings">$0</span>
+          </div>
         </div>
-        <button class="btn-sync-plaid" id="btn-sync-plaid" title="Pull latest transactions from Plaid now">⟳ Sync now</button>
-        <div class="sync-status hidden" id="sync-status"></div>
-        <div class="receipt-status-row">
-          <span class="receipt-status-text" id="receipt-status-text"></span>
-          <button class="btn-check-receipts" id="btn-check-receipts" title="Check the receipt inbox now">🧾 Check now</button>
+        <div class="header-actions">
+          <button class="action-btn" id="btn-sync-plaid" title="Sync now">
+            ⟳<span class="action-dot hidden" id="sync-dot"></span>
+          </button>
+          <button class="action-btn" id="btn-check-receipts" title="Check the receipt inbox">
+            🧾<span class="action-dot hidden" id="receipts-dot"></span>
+          </button>
         </div>
       </div>
+      <div class="header-status-line hidden" id="header-status-line"></div>
 
       <div class="view active" id="view-dashboard">
         <div class="dashboard-hero">
@@ -288,23 +288,25 @@
           <div class="notes-amount" id="notes-amount">$0.00</div>
           <div class="notes-date" id="notes-date"></div>
         </div>
-        <div class="modal-label">Add/Edit Notes</div>
-        <textarea id="notes-input" placeholder="Add notes about this transaction..." maxlength="255"></textarea>
+        <div class="modal-notes-body" id="notes-body">
+          <div class="modal-label">Add/Edit Notes</div>
+          <textarea id="notes-input" placeholder="Add notes about this transaction..." maxlength="255"></textarea>
 
-        <!-- Receipt-backed transactions: item categories are edited inline here
-             instead of a separate Split screen — one screen for notes + categorization. -->
-        <div class="split-items-editor hidden" id="notes-items-editor">
-          <div class="modal-label">Item categories</div>
-          <div class="split-item-rows" id="notes-item-rows"></div>
-        </div>
+          <!-- Receipt-backed transactions: item categories are edited inline here
+               instead of a separate Split screen — one screen for notes + categorization. -->
+          <div class="split-items-editor hidden" id="notes-items-editor">
+            <div class="modal-label">Item categories</div>
+            <div class="split-item-rows" id="notes-item-rows"></div>
+          </div>
 
-        <!-- Transactions with no receipt data: single category or dollar-amount split -->
-        <div id="notes-category-editor">
-          <div class="modal-label">Change Category</div>
-          <select id="notes-category" class="notes-category-select">
-            <option value="">No category</option>
-          </select>
-          <button class="btn-split-transaction" id="btn-split-transaction">✂️ Split into multiple categories</button>
+          <!-- Transactions with no receipt data: single category or dollar-amount split -->
+          <div id="notes-category-editor">
+            <div class="modal-label">Change Category</div>
+            <select id="notes-category" class="notes-category-select">
+              <option value="">No category</option>
+            </select>
+            <button class="btn-split-transaction" id="btn-split-transaction">✂️ Split into multiple categories</button>
+          </div>
         </div>
 
         <div class="modal-notes-buttons">

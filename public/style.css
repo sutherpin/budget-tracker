@@ -215,97 +215,97 @@ html, body {
 }
 .account-balance-bar {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 12px;
   padding: 10px 20px;
   background: var(--bg);
   border-bottom: 1px solid var(--bg3);
 }
 .account-balance {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-}
-.account-balance-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  gap: 28px;
-}
-.account-balance-note {
-  font-size: 11px;
-  color: var(--text-dim);
-}
-.sync-status {
-  font-size: 11px;
-  color: var(--text-dim);
-  font-style: italic;
-}
-.receipt-status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 2px;
-}
-.receipt-status-text {
-  font-size: 11px;
-  color: var(--text-dim);
-}
-.btn-check-receipts {
-  background: transparent;
-  color: var(--text-dim);
-  border: 1px solid var(--bg3);
-  padding: 3px 8px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 600;
-}
-.btn-check-receipts:hover {
-  color: var(--text);
-  border-color: var(--text-dim);
-}
-.btn-check-receipts:disabled {
-  opacity: 0.6;
-  cursor: default;
+  gap: 20px;
 }
 .account-balance-item {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
 }
 .account-balance-label {
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 600;
   color: var(--text-dim);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 .account-balance-amount {
-  font-size: 22px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 23px;
   font-weight: 800;
   color: #22c55e;
 }
-.btn-sync-plaid {
-  background: transparent;
+.header-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.action-btn {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 17px;
+  background: var(--bg3);
+  border: none;
   color: var(--text-dim);
-  border: 1px solid var(--bg3);
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
+  font-size: 15px;
   cursor: pointer;
-  font-size: 11px;
-  font-weight: 600;
-  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s, color 0.15s;
 }
-.btn-sync-plaid:hover {
+.action-btn:hover {
   color: var(--text);
-  border-color: var(--text-dim);
 }
-.btn-sync-plaid:disabled {
+.action-btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+.action-btn.busy {
+  color: var(--accent);
+}
+#btn-sync-plaid.busy {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #btn-sync-plaid.busy {
+    animation: none;
+  }
+}
+.action-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 5px;
+  background: var(--danger);
+  border: 2px solid var(--bg);
+}
+/* Status text (sync progress, receipt-check results, etc.) used to sit
+   permanently on screen — now it only appears briefly after tapping an
+   action button, so the idle header stays compact. */
+.header-status-line {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
+  padding: 6px 20px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--bg3);
 }
 
 .view {
@@ -655,6 +655,11 @@ html, body {
   color: var(--text-dim);
   padding: 48px 20px;
   font-size: 15px;
+}
+
+.empty-state-error {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .settings-list {
@@ -1263,6 +1268,18 @@ html, body {
   cursor: pointer;
 }
 
+.transaction-id {
+  flex: 0 0 auto;
+  font-family: 'DM Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  align-self: flex-start;
+  margin-top: 2px;
+  margin-right: 10px;
+  width: 40px;
+  text-align: right;
+}
+
 .transaction-info {
   display: flex;
   flex-direction: column;
@@ -1476,6 +1493,31 @@ html, body {
   position: relative;
 }
 
+/* Item-category editing needs real room to breathe (a description, a
+   friendly-name guess, an amount, and a category dropdown per row), so this
+   variant grows the sheet taller and wider than the plain notes/category
+   case, while keeping the header and Save/Cancel footer pinned and letting
+   only the middle section scroll. */
+#modal-notes .modal-card.modal-card-expanded {
+  width: 94%;
+  max-width: 640px;
+  height: 88vh;
+  max-height: 88vh;
+  overflow-y: hidden;
+}
+#modal-notes .modal-card.modal-card-expanded .modal-notes-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+/* The body is already the scroll container in expanded mode, so the item
+   list shouldn't also cap its own height and scroll internally — that would
+   nest two scrollbars. */
+#modal-notes .modal-card.modal-card-expanded .split-item-rows {
+  max-height: none;
+  overflow-y: visible;
+}
+
 .modal-notes-header {
   text-align: center;
   margin-bottom: 8px;
@@ -1659,10 +1701,23 @@ html, body {
 .split-item-row:nth-child(even) {
   background: var(--bg3);
 }
-.split-item-desc {
+.split-item-desc-wrap {
   flex: 1 1 auto;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.split-item-desc {
   font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.split-item-friendly {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1990,4 +2045,30 @@ html, body {
 }
 .btn-dismiss-duplicate:hover {
   color: var(--text);
+}
+
+.error-toast {
+  position: fixed;
+  bottom: calc(var(--nav-h) + 16px);
+  left: 50%;
+  transform: translateX(-50%) translateY(12px);
+  background: var(--bg2);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 12px 18px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  max-width: min(90vw, 420px);
+  text-align: center;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  z-index: 2000;
+}
+.error-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
 }

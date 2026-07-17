@@ -1,5 +1,24 @@
 const API = location.origin;
 
+// Shared visible feedback for actions that fail silently otherwise (a tap
+// that just... does nothing). Always logs to console too, so the message is
+// never only in one place.
+let errorToastTimer = null;
+function showErrorToast(message) {
+  console.error(message);
+  let toast = document.getElementById('error-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'error-toast';
+    toast.className = 'error-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = `⚠️ ${message}`;
+  toast.classList.add('show');
+  clearTimeout(errorToastTimer);
+  errorToastTimer = setTimeout(() => toast.classList.remove('show'), 5000);
+}
+
 // Pending Walmart/Amazon/Target/Costco charges get auto-categorized from a
 // matched receipt within ~30 min (see the receipt-check cron) — flag them so
 // the user doesn't jump in and categorize manually while that's still in
@@ -380,8 +399,7 @@ async function resolveDuplicate(flagId, keepId, removeId) {
     await loadPending();
     if (activeView === 'transactions') await loadTransactions();
   } catch (err) {
-    console.error('Resolve duplicate failed:', err);
-    alert('Failed to resolve duplicate');
+    showErrorToast(`Failed to resolve duplicate: ${err.message}`);
   }
 }
 
@@ -392,7 +410,7 @@ async function dismissDuplicate(flagId) {
     updateDuplicateBadge(state.duplicates.length);
     renderDuplicates();
   } catch (err) {
-    console.error('Dismiss duplicate failed:', err);
+    showErrorToast(`Failed to dismiss duplicate: ${err.message}`);
   }
 }
 
@@ -494,21 +512,46 @@ function formatRelativeTime(isoString) {
   return `${days}d ago`;
 }
 
+// Shared transient status line under the compact header — replaces the
+// permanently-visible sync/receipt status text that used to sit in the
+// header at all times. Both actions share one line since only one is ever
+// likely to be running at a time.
+let headerStatusTimer = null;
+function showHeaderStatus(text, ms) {
+  const el = document.getElementById('header-status-line');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove('hidden');
+  clearTimeout(headerStatusTimer);
+  headerStatusTimer = setTimeout(() => el.classList.add('hidden'), ms || 3000);
+}
+
+// Auto-refresh runs twice daily (~12h apart) — if it's been meaningfully
+// longer than that since the balance last updated, the cron may have missed
+// a run, so nudge toward a manual sync with a dot instead of silently
+// showing stale numbers.
+const BALANCE_STALE_HOURS = 13;
+
 async function loadBalance() {
   try {
     const data = await apiFetch('/api/plaid/balance');
     const el = document.getElementById('account-balance');
+    const dot = document.getElementById('sync-dot');
+    const btn = document.getElementById('btn-sync-plaid');
     if (data.checking === null && data.savings === null) {
       el.classList.add('hidden');
       return;
     }
     document.getElementById('account-balance-checking').textContent = fmt(data.checking ?? 0);
     document.getElementById('account-balance-savings').textContent = fmt(data.savings ?? 0);
-    const noteEl = document.getElementById('account-balance-note');
-    if (noteEl) {
-      noteEl.textContent = data.asOf
-        ? `Updated ${formatRelativeTime(data.asOf)} · refreshes twice daily (12am & 12pm)`
-        : 'Refreshes twice daily (12am & 12pm)';
+    if (btn) {
+      btn.title = data.asOf
+        ? `Sync now — updated ${formatRelativeTime(data.asOf)}`
+        : 'Sync now';
+    }
+    if (dot) {
+      const hoursSince = data.asOf ? (Date.now() - new Date(data.asOf).getTime()) / 3600000 : 0;
+      dot.classList.toggle('hidden', !data.asOf || hoursSince < BALANCE_STALE_HOURS);
     }
     el.classList.remove('hidden');
   } catch (err) {
@@ -530,43 +573,33 @@ const SYNC_STATUS_STEPS = [
 
 async function syncPlaidNow() {
   const btn = document.getElementById('btn-sync-plaid');
-  const statusEl = document.getElementById('sync-status');
   if (!btn) return;
   btn.disabled = true;
-  btn.textContent = 'Syncing…';
+  btn.classList.add('busy');
   const timers = SYNC_STATUS_STEPS.map((step) => setTimeout(() => {
-    if (statusEl) {
-      statusEl.textContent = step.text;
-      statusEl.classList.remove('hidden');
-    }
+    showHeaderStatus(step.text, 10000);
   }, step.at));
   try {
     const data = await apiFetch('/api/plaid/sync-now', { method: 'POST' });
-    btn.textContent = data.added > 0 ? `✓ ${data.added} new` : '✓ Up to date';
-    if (statusEl) statusEl.textContent = data.added > 0 ? `Added ${data.added} new transaction(s)` : 'Nothing new since last check';
+    showHeaderStatus(data.added > 0 ? `✓ Added ${data.added} new transaction(s)` : '✓ Nothing new since last check');
     await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates()]);
     if (activeView === 'transactions') await loadTransactions();
   } catch (err) {
-    console.error('Plaid sync-now failed:', err);
-    btn.textContent = '✗ Sync failed';
-    if (statusEl) statusEl.textContent = 'Sync failed — check connection and try again';
+    showHeaderStatus(`✗ Sync failed: ${err.message}`, 5000);
   } finally {
     timers.forEach(clearTimeout);
-    setTimeout(() => {
-      btn.textContent = '⟳ Sync now';
-      btn.disabled = false;
-      if (statusEl) statusEl.classList.add('hidden');
-    }, 3000);
+    btn.classList.remove('busy');
+    btn.disabled = false;
   }
 }
 
 const RECEIPT_CHECK_INTERVAL_MINUTES = 30;
 
 function renderReceiptStatusText(data) {
-  const textEl = document.getElementById('receipt-status-text');
-  if (!textEl) return;
+  const btn = document.getElementById('btn-check-receipts');
+  if (!btn) return;
   if (!data.lastRunAt) {
-    textEl.textContent = 'Receipt inbox not checked yet';
+    btn.title = 'Check the receipt inbox — not checked yet';
     return;
   }
   const lastRun = new Date(data.lastRunAt.includes('T') ? data.lastRunAt : data.lastRunAt.replace(' ', 'T') + 'Z');
@@ -574,7 +607,7 @@ function renderReceiptStatusText(data) {
   const minutesLeft = Math.max(0, RECEIPT_CHECK_INTERVAL_MINUTES - minutesSince);
   const foundText = data.lastRunCount ? ` (found ${data.lastRunCount})` : '';
   const nextText = minutesLeft > 0 ? `next check in ~${minutesLeft}m` : 'checking again soon';
-  textEl.textContent = `🧾 Checked ${formatRelativeTime(data.lastRunAt)}${foundText} · ${nextText}`;
+  btn.title = `Checked ${formatRelativeTime(data.lastRunAt)}${foundText} · ${nextText}`;
 }
 
 // Builds the same "header line + bullet lines" text shape that
@@ -591,12 +624,16 @@ function receiptItemsNoteText(receipt) {
   }
   if (!parsed.items || !parsed.items.length) return '';
   const merchantLabel = receiptMerchantLabel(receipt.source);
-  const lines = parsed.items.map((i) => `• ${i.description} — ${fmt(i.amount)} (${i.category})`);
+  const lines = parsed.items.map((i) =>
+    `• ${i.description}${i.friendlyName ? ` (≈ ${i.friendlyName})` : ''} — ${fmt(i.amount)} (${i.category})`
+  );
   return [`${merchantLabel} items:`, ...lines].join('\n');
 }
 
 function renderUnclaimedReceipts(receipts) {
   const listEl = document.getElementById('unclaimed-receipts-list');
+  const dot = document.getElementById('receipts-dot');
+  if (dot) dot.classList.toggle('hidden', !receipts || !receipts.length);
   if (!listEl) return;
   if (!receipts || !receipts.length) {
     listEl.classList.add('hidden');
@@ -649,7 +686,7 @@ async function openMatchReceiptModal(receipt) {
     data = await apiFetch(`/api/receipts/${receipt.id}/candidates`);
   } catch (err) {
     console.error('Failed to load match candidates:', err);
-    listEl.innerHTML = '<div class="empty-state">Failed to load candidate transactions</div>';
+    listEl.innerHTML = `<div class="empty-state empty-state-error">⚠️ Failed to load candidate transactions: ${err.message}</div>`;
     return;
   }
   if (!data.candidates.length) {
@@ -715,7 +752,7 @@ async function openReturnMatchModal(txn) {
     data = await apiFetch(`/api/returns/candidates?merchant=${encodeURIComponent(txn.merchant || '')}&amount=${txn.amount}`);
   } catch (err) {
     console.error('Failed to load return candidates:', err);
-    listEl.innerHTML = '<div class="empty-state">Failed to load candidate items</div>';
+    listEl.innerHTML = `<div class="empty-state empty-state-error">⚠️ Failed to load candidate items: ${err.message}</div>`;
     return;
   }
 
@@ -845,20 +882,18 @@ async function checkReceiptsNow() {
   const btn = document.getElementById('btn-check-receipts');
   if (!btn) return;
   btn.disabled = true;
-  btn.textContent = 'Checking…';
+  btn.classList.add('busy');
+  showHeaderStatus('Checking receipt inbox…', 10000);
   try {
     const data = await apiFetch('/api/receipts/sync-now', { method: 'POST' });
-    btn.textContent = data.count > 0 ? `✓ ${data.count} processed` : '✓ Nothing new';
+    showHeaderStatus(data.count > 0 ? `✓ ${data.count} receipt(s) processed` : '✓ Nothing new');
     await loadReceiptStatus();
     await loadPending();
   } catch (err) {
-    console.error('Receipt check failed:', err);
-    btn.textContent = '✗ Check failed';
+    showErrorToast(`Receipt check failed: ${err.message}`);
   } finally {
-    setTimeout(() => {
-      btn.textContent = '🧾 Check now';
-      btn.disabled = false;
-    }, 3000);
+    btn.classList.remove('busy');
+    btn.disabled = false;
   }
 }
 
@@ -906,8 +941,7 @@ function createPlaidLinkHandler(token, btn) {
         });
         await loadLinkedAccounts();
       } catch (err) {
-        console.error('Plaid exchange failed:', err);
-        alert('Connected to Plaid, but saving the account failed. Please try again.');
+        showErrorToast(`Connected to Plaid, but saving the account failed: ${err.message}`);
       } finally {
         if (btn) {
           btn.disabled = false;
@@ -936,10 +970,9 @@ async function connectBank() {
     sessionStorage.setItem('plaid_link_token', link_token);
     createPlaidLinkHandler(link_token, btn).open();
   } catch (err) {
-    console.error('Creating Plaid link token failed:', err);
     btn.disabled = false;
     btn.textContent = '+ Connect a bank';
-    alert('Could not start bank connection. Please try again.');
+    showErrorToast(`Could not start bank connection: ${err.message}`);
   }
 }
 
@@ -1411,7 +1444,7 @@ async function openCategoryDetail(cat) {
     renderCategoryDetailList(data.transactions);
   } catch (err) {
     console.error('Category detail load failed:', err);
-    listEl.innerHTML = '<div class="empty-state">Failed to load transactions</div>';
+    listEl.innerHTML = `<div class="empty-state empty-state-error">⚠️ Failed to load transactions: ${err.message}</div>`;
   }
 }
 
@@ -1426,6 +1459,7 @@ function renderCategoryDetailList(transactions) {
     const item = document.createElement('div');
     item.className = 'transaction-item transaction-item-clickable';
     item.innerHTML = `
+      <span class="transaction-id" title="Transaction ID">#${txn.id}</span>
       <div class="transaction-info">
         <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
@@ -1459,7 +1493,7 @@ async function saveCategoryNote() {
     const cat = state.dashboard.categories.find((c) => c.categoryId === state.currentCategoryDetailId);
     if (cat) cat.note = noteEl.value;
   } catch (err) {
-    console.error('Save category note failed:', err);
+    showErrorToast(`Note didn't save: ${err.message}`);
   }
 }
 
@@ -1487,7 +1521,7 @@ async function loadPending() {
     renderPending(data.transactions);
     updatePendingBadge(data.transactions.length);
   } catch (err) {
-    console.error('Pending load failed:', err);
+    showErrorToast(`Failed to load pending transactions: ${err.message}`);
   }
 }
 
@@ -1507,6 +1541,7 @@ function renderPending(transactions) {
     const card = document.createElement('div');
     card.className = 'pending-card';
     card.innerHTML = `
+      <span class="transaction-id" title="Transaction ID">#${txn.id}</span>
       <div class="pending-info">
         <div class="pending-merchant">${txn.merchant || 'Unknown merchant'}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
         <div class="pending-date">${formatDate(txn.occurred_at)}</div>
@@ -1573,7 +1608,7 @@ async function categorize(transactionId, categoryId) {
     await Promise.all([loadPending(), loadDashboard()]);
     if (state.pending.length > 0) openCategorizeModal(state.pending[0]);
   } catch (err) {
-    console.error('Categorize failed:', err);
+    showErrorToast(`Failed to categorize: ${err.message}`);
   }
 }
 
@@ -1711,8 +1746,7 @@ async function deleteRecurringTransaction(id) {
     await loadRecurringTransactions();
     renderRecurringTransactions();
   } catch (err) {
-    console.error('Delete recurring transaction failed:', err);
-    alert('Failed to delete recurring transaction');
+    showErrorToast(`Failed to delete recurring transaction: ${err.message}`);
   }
 }
 
@@ -1777,8 +1811,7 @@ async function toggleCategoryInclusion(categoryId, includedInBudget) {
     if (cat) cat.included_in_budget = includedInBudget ? 1 : 0;
     await loadDashboard();
   } catch (err) {
-    console.error('Toggle category inclusion failed:', err);
-    alert('Failed to update category. Please try again.');
+    showErrorToast(`Failed to update category: ${err.message}`);
     renderSettings(state.categories); // revert the toggle UI
   }
 }
@@ -1791,8 +1824,7 @@ async function deleteCategory(id, name) {
     await loadDashboard();
     renderSettings(state.categories);
   } catch (err) {
-    console.error('Delete category failed:', err);
-    alert('Failed to delete category');
+    showErrorToast(`Failed to delete category: ${err.message}`);
   }
 }
 
@@ -1916,7 +1948,7 @@ async function saveBudgets() {
     }, 1800);
     await loadDashboard();
   } catch (err) {
-    console.error('Save budgets failed:', err);
+    showErrorToast(`Failed to save budgets: ${err.message}`);
   }
 }
 
@@ -2075,8 +2107,7 @@ async function addManualTransaction() {
 
     await Promise.all([loadPending(), loadDashboard()]);
   } catch (err) {
-    console.error('Add manual transaction failed:', err);
-    alert('Failed to add transaction');
+    showErrorToast(`Failed to add transaction: ${err.message}`);
   }
 }
 
@@ -2098,7 +2129,7 @@ async function loadTransactions() {
     loadedTransactions = data.transactions;
     renderTransactions(filterTransactionsBySearch(loadedTransactions));
   } catch (err) {
-    console.error('Transactions load failed:', err);
+    showErrorToast(`Failed to load transactions: ${err.message}`);
   }
 }
 
@@ -2129,6 +2160,7 @@ function renderTransactions(transactions) {
       const item = document.createElement('div');
       item.className = 'transaction-item transaction-item-clickable';
       item.innerHTML = `
+        <span class="transaction-id" title="Transaction ID">#${txn.id}</span>
         <div class="transaction-info">
           <div class="transaction-merchant">${txn.merchant || 'Unknown merchant'}${txn.is_split ? ' <span class="split-badge">split</span>' : ''}${txn.plaid_pending ? ' <span class="pending-badge-inline">pending</span>' : ''}${txn.status === 'needs_review' ? ' <span class="needs-review-badge">⚠️ needs categorization</span>' : ''}${awaitingReceiptBadgeHtml(txn)}</div>
           <div class="transaction-date">${formatDate(txn.occurred_at)}</div>
@@ -2177,8 +2209,7 @@ async function deleteTransaction(transactionId) {
     });
     await refreshAfterTransactionChange();
   } catch (err) {
-    console.error('Delete transaction failed:', err);
-    alert('Failed to delete transaction');
+    showErrorToast(`Failed to delete transaction: ${err.message}`);
   }
 }
 
@@ -2263,13 +2294,16 @@ async function openNotesModal(transaction) {
   state.currentTxn = txn;
   document.getElementById('notes-input').value = txn.notes || '';
 
+  const modalCard = document.querySelector('#modal-notes .modal-card');
   if (txn.receiptItems && txn.receiptItems.length) {
+    modalCard.classList.add('modal-card-expanded');
     document.getElementById('notes-category-editor').classList.add('hidden');
     document.getElementById('notes-items-editor').classList.remove('hidden');
     renderItemCategoryRows(document.getElementById('notes-item-rows'), txn.receiptItems);
     return;
   }
 
+  modalCard.classList.remove('modal-card-expanded');
   document.getElementById('notes-items-editor').classList.add('hidden');
   document.getElementById('notes-category-editor').classList.remove('hidden');
 
@@ -2325,8 +2359,7 @@ async function openSplitModal() {
   try {
     txn = await apiFetch(`/api/transactions/${transactionId}`);
   } catch (err) {
-    console.error('Failed to load transaction for split:', err);
-    alert('Failed to load transaction details');
+    showErrorToast(`Failed to load transaction details: ${err.message}`);
     closeSplitModal();
     return;
   }
@@ -2357,7 +2390,10 @@ function renderItemCategoryRows(containerEl, items) {
     const row = document.createElement('div');
     row.className = 'split-item-row';
     row.innerHTML = `
-      <span class="split-item-desc">${item.description}${item.uncertain ? ' <span class="split-item-uncertain" title="Low-confidence guess">⚠️</span>' : ''}</span>
+      <span class="split-item-desc-wrap">
+        <span class="split-item-desc">${item.description}${item.uncertain ? ' <span class="split-item-uncertain" title="Low-confidence guess">⚠️</span>' : ''}</span>
+        ${item.friendlyName ? `<span class="split-item-friendly">≈ ${item.friendlyName}</span>` : ''}
+      </span>
       <span class="split-item-amount">${fmt(item.amount)}</span>
       <select class="split-item-category">
         <option value="">Choose category</option>
@@ -2385,8 +2421,7 @@ async function categorizeSplitAsSingleCategory() {
     restoreCategoryDetailModalIfNeeded();
     await refreshAfterTransactionChange();
   } catch (err) {
-    console.error('Categorize failed:', err);
-    alert('Failed to categorize');
+    showErrorToast(`Failed to categorize: ${err.message}`);
   }
 }
 
