@@ -1177,6 +1177,9 @@ function renderDashboard(data) {
     const pct = cat.allotted > 0 ? Math.min((cat.spent / cat.allotted) * 100, 100) : 0;
     const remaining = cat.allotted - cat.spent;
     const overBudget = remaining < 0;
+    const rolloverNote = cat.rollover && cat.rolledOver
+      ? `<div class="cat-rollover-note">🔁 ${cat.rolledOver >= 0 ? '+' : '-'}${fmt(Math.abs(cat.rolledOver))} rolled ${cat.rolledOver >= 0 ? 'in' : '(deficit)'} from prior months</div>`
+      : '';
     const card = document.createElement('div');
     card.className = 'cat-card';
     card.innerHTML = `
@@ -1184,6 +1187,7 @@ function renderDashboard(data) {
       <div class="cat-info">
         <div class="cat-name">${cat.name}</div>
         <div class="cat-amounts">${fmt(cat.spent)} of ${fmt(cat.allotted)}</div>
+        ${rolloverNote}
         ${cat.note ? `<div class="cat-note">${cat.note}</div>` : ''}
         <div class="cat-bar-wrap">
           <div class="cat-bar" style="width:0%;background:${cat.color}" data-pct="${pct}"></div>
@@ -1757,6 +1761,7 @@ function renderSettings(categories) {
     const existing = state.dashboard.categories?.find((c) => c.categoryId === cat.id);
     const amount = existing?.allotted || 0;
     const included = cat.included_in_budget === undefined ? true : !!cat.included_in_budget;
+    const rollover = !!cat.rollover;
     const row = document.createElement('div');
     row.className = 'settings-row';
     row.style.borderLeftColor = cat.color || 'transparent';
@@ -1768,6 +1773,11 @@ function renderSettings(categories) {
           <input type="checkbox" class="settings-toggle-input" data-cat-id="${cat.id}" ${included ? 'checked' : ''} />
           <span class="settings-toggle-slider"></span>
           <span class="settings-toggle-label">Include in budget</span>
+        </label>
+        <label class="settings-toggle" title="Unused budget carries into next month instead of resetting (and overspending carries forward as a deficit)">
+          <input type="checkbox" class="settings-toggle-input settings-rollover-input" data-cat-id="${cat.id}" ${rollover ? 'checked' : ''} />
+          <span class="settings-toggle-slider"></span>
+          <span class="settings-toggle-label">🔁 Roll over unused budget</span>
         </label>
       </div>
       <input
@@ -1790,6 +1800,9 @@ function renderSettings(categories) {
     const toggleInput = row.querySelector('.settings-toggle-input');
     toggleInput.addEventListener('change', () => toggleCategoryInclusion(cat.id, toggleInput.checked));
 
+    const rolloverInput = row.querySelector('.settings-rollover-input');
+    rolloverInput.addEventListener('change', () => toggleCategoryRollover(cat.id, rolloverInput.checked));
+
     const editBtn = row.querySelector('.btn-edit-cat');
     editBtn.addEventListener('click', () => editCategoryName(cat.id, cat.name, cat.icon, cat.color));
 
@@ -1809,6 +1822,22 @@ async function toggleCategoryInclusion(categoryId, includedInBudget) {
     });
     const cat = state.categories.find((c) => c.id === categoryId);
     if (cat) cat.included_in_budget = includedInBudget ? 1 : 0;
+    await loadDashboard();
+  } catch (err) {
+    showErrorToast(`Failed to update category: ${err.message}`);
+    renderSettings(state.categories); // revert the toggle UI
+  }
+}
+
+async function toggleCategoryRollover(categoryId, rollover) {
+  try {
+    await apiFetch(`/api/categories/${categoryId}/rollover`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rollover }),
+    });
+    const cat = state.categories.find((c) => c.id === categoryId);
+    if (cat) cat.rollover = rollover ? 1 : 0;
     await loadDashboard();
   } catch (err) {
     showErrorToast(`Failed to update category: ${err.message}`);

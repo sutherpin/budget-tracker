@@ -814,6 +814,9 @@ var index_default = {
       if (/^\/api\/categories\/\d+\/inclusion$/.test(url.pathname) && request.method === "PATCH") {
         return await handleToggleCategoryInclusion(request, env);
       }
+      if (/^\/api\/categories\/\d+\/rollover$/.test(url.pathname) && request.method === "PATCH") {
+        return await handleToggleCategoryRollover(request, env);
+      }
       if (/^\/api\/categories\/\d+\/note$/.test(url.pathname) && request.method === "PATCH") {
         return await handleSaveCategoryNote(request, env);
       }
@@ -2795,11 +2798,63 @@ async function processTableData(env, tableName, headers, dataRows) {
 __name(processTableData, "processTableData");
 async function handleCategories(env) {
   const { results } = await env.DB.prepare(
-    "SELECT id, name, icon, color, included_in_budget FROM categories WHERE is_active = 1 ORDER BY name"
+    "SELECT id, name, icon, color, included_in_budget, rollover FROM categories WHERE is_active = 1 ORDER BY name"
   ).all();
   return jsonResponse({ categories: results });
 }
 __name(handleCategories, "handleCategories");
+// For a rollover-enabled category, "budgeted this month" isn't just this
+// month's flat number — it's that number plus whatever surplus/deficit
+// carried forward from every prior month, walked forward one month at a
+// time (mirrors an envelope/YNAB-style running balance). Recomputed fresh
+// from full history each call rather than cached, since a category can be
+// re-categorized or a past transaction edited at any time.
+async function computeRolloverAdjustedAllotted(env, categoryId, targetMonth, baseAllottedForTargetMonth) {
+  const { results: monthRows } = await env.DB.prepare(
+    `SELECT DISTINCT month FROM (
+      SELECT month FROM budgets WHERE category_id = ? AND month < ?
+      UNION
+      SELECT strftime('%Y-%m', occurred_at) AS month FROM transactions
+        WHERE category_id = ? AND transaction_type = 'purchase' AND status = 'categorized' AND is_split = 0
+          AND strftime('%Y-%m', occurred_at) < ?
+      UNION
+      SELECT strftime('%Y-%m', t.occurred_at) AS month FROM transaction_splits ts
+        JOIN transactions t ON t.id = ts.transaction_id
+        WHERE ts.category_id = ? AND t.transaction_type = 'purchase' AND t.status = 'categorized'
+          AND strftime('%Y-%m', t.occurred_at) < ?
+    ) ORDER BY month ASC`
+  ).bind(categoryId, targetMonth, categoryId, targetMonth, categoryId, targetMonth).all();
+
+  let rolloverBalance = 0;
+  for (const { month } of monthRows) {
+    const budgetRow = await env.DB.prepare(
+      `SELECT allotted_amount FROM budgets WHERE category_id = ? AND month = (
+        SELECT MAX(month) FROM budgets WHERE category_id = ? AND month <= ?
+      )`
+    ).bind(categoryId, categoryId, month).first();
+    const baseAllotted = budgetRow?.allotted_amount || 0;
+    const spendRow = await env.DB.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS spent FROM (
+        SELECT amount FROM transactions
+          WHERE category_id = ? AND transaction_type = 'purchase' AND status = 'categorized' AND is_split = 0
+            AND strftime('%Y-%m', occurred_at) = ?
+        UNION ALL
+        SELECT ts.amount FROM transaction_splits ts
+          JOIN transactions t ON t.id = ts.transaction_id
+          WHERE ts.category_id = ? AND t.transaction_type = 'purchase' AND t.status = 'categorized'
+            AND strftime('%Y-%m', t.occurred_at) = ?
+      )`
+    ).bind(categoryId, month, categoryId, month).first();
+    const spent = spendRow?.spent || 0;
+    const effectiveAllotted = baseAllotted + rolloverBalance;
+    rolloverBalance = effectiveAllotted - spent;
+  }
+  return {
+    allotted: baseAllottedForTargetMonth + rolloverBalance,
+    rolledOver: rolloverBalance
+  };
+}
+__name(computeRolloverAdjustedAllotted, "computeRolloverAdjustedAllotted");
 async function handleDashboard(env, url) {
   const month = url.searchParams.get("month") || (/* @__PURE__ */ new Date()).toISOString().slice(0, 7);
   const { results } = await env.DB.prepare(
@@ -2808,6 +2863,7 @@ async function handleDashboard(env, url) {
     c.name,
     c.icon,
     c.color,
+    c.rollover,
     COALESCE(b.allotted_amount, 0) AS allotted,
     COALESCE(SUM(spend.amount), 0) AS spent,
     cn.note AS note
@@ -2833,9 +2889,12 @@ async function handleDashboard(env, url) {
     ORDER BY c.name`
   ).bind(month, month, month, month).all();
   console.log("Raw dashboard results:", results);
-  const summary = results.map((row) => ({
-    ...row,
-    remaining: row.allotted - row.spent
+  const summary = await Promise.all(results.map(async (row) => {
+    if (!row.rollover) {
+      return { ...row, remaining: row.allotted - row.spent };
+    }
+    const { allotted, rolledOver } = await computeRolloverAdjustedAllotted(env, row.categoryId, month, row.allotted);
+    return { ...row, allotted, rolledOver, remaining: allotted - row.spent };
   }));
 
   // Excludes internal self-transfers (e.g. "Withdrawal INTERNET XFR TO SAVGS") —
@@ -2969,6 +3028,28 @@ async function handleToggleCategoryInclusion(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleToggleCategoryInclusion, "handleToggleCategoryInclusion");
+async function handleToggleCategoryRollover(request, env) {
+  const parts = new URL(request.url).pathname.split("/");
+  const id = parts[parts.length - 2];
+  if (!id) {
+    return jsonResponse({ error: "ID is required" }, 400);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+  const { rollover } = body;
+  if (typeof rollover !== "boolean") {
+    return jsonResponse({ error: "rollover (boolean) is required" }, 400);
+  }
+  await env.DB.prepare(
+    `UPDATE categories SET rollover = ? WHERE id = ?`
+  ).bind(rollover ? 1 : 0, id).run();
+  return jsonResponse({ success: true });
+}
+__name(handleToggleCategoryRollover, "handleToggleCategoryRollover");
 async function handleSaveCategoryNote(request, env) {
   const parts = new URL(request.url).pathname.split("/");
   const id = parts[parts.length - 2];
