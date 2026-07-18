@@ -411,8 +411,8 @@ html, body {
 }
 #legend-under .mini-pie-legend-amount { color: #007aff; }
 #legend-over .mini-pie-legend-amount { color: var(--danger); }
-#legend-merchants .mini-pie-legend-amount { color: #7c3aed; }
-#legend-merchants-lifetime .mini-pie-legend-amount { color: #7c3aed; }
+#legend-merchants .mini-pie-legend-amount { color: var(--text); }
+#legend-merchants-lifetime .mini-pie-legend-amount { color: var(--text); }
 
 @media (max-width: 700px) {
   .main-pie-wrap {
