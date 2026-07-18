@@ -1707,6 +1707,15 @@ tax line — in that case, set subtotal to the sum of the item prices, and set t
 (total - subtotal). If the email does show an explicit subtotal/tax breakdown instead, use those
 printed values directly.
 
+Amazon sends more than one email layout. The detailed layout lists each product's actual title.
+A shorter "order tracker" layout (a Ordered → Shipped → Out for delivery → Delivered progress
+bar, "Arriving tomorrow", "View or edit order") often does NOT name the product at all — instead
+it just shows a category summary line like "1 Automotive item" or "2 Grocery items" next to the
+Grand Total, with no per-item price breakdown. This is still a real receipt — don't reject it for
+lacking a product title. When there's no itemized breakdown, create a single item using that
+category summary line as its description (e.g. "1 Automotive item"), set its amount to the full
+total, and set "uncertain" to true since the specific product isn't named.
+
 Convert the order date to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
 lookups, so it must be a real, correctly converted calendar date. Prefer an explicit order date
 found in the email text itself (e.g. inside a forwarded "Date:" header or an "Order Placed" line)
