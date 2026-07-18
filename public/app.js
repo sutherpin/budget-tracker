@@ -24,12 +24,13 @@ function showErrorToast(message) {
 // the user doesn't jump in and categorize manually while that's still in
 // flight.
 function isReturnTrackedVendor(merchant) {
-  return /wal[\s-]?mart|wm\s*supercenter|amazon|target|costco/i.test(merchant || '');
+  return /wal[\s-]?mart|wm\s*supercenter|amazon|ebay|target|costco/i.test(merchant || '');
 }
 
 const RECEIPT_MERCHANT_LABELS = {
   walmart: 'Walmart',
   amazon: 'Amazon',
+  ebay: 'eBay',
   target: 'Target',
   costco: 'Costco',
 };
@@ -1813,15 +1814,17 @@ function renderSettings(categories) {
   });
 }
 
-async function toggleCategoryInclusion(categoryId, includedInBudget) {
+// Both category toggles (include-in-budget, rollover) hit a differently-named
+// endpoint/body-key/state-field for the same boolean-flip operation.
+async function toggleCategoryBoolean(categoryId, value, { endpoint, bodyKey, stateField }) {
   try {
-    await apiFetch(`/api/categories/${categoryId}/inclusion`, {
+    await apiFetch(`/api/categories/${categoryId}/${endpoint}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ includedInBudget }),
+      body: JSON.stringify({ [bodyKey]: value }),
     });
     const cat = state.categories.find((c) => c.id === categoryId);
-    if (cat) cat.included_in_budget = includedInBudget ? 1 : 0;
+    if (cat) cat[stateField] = value ? 1 : 0;
     await loadDashboard();
   } catch (err) {
     showErrorToast(`Failed to update category: ${err.message}`);
@@ -1829,20 +1832,16 @@ async function toggleCategoryInclusion(categoryId, includedInBudget) {
   }
 }
 
-async function toggleCategoryRollover(categoryId, rollover) {
-  try {
-    await apiFetch(`/api/categories/${categoryId}/rollover`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rollover }),
-    });
-    const cat = state.categories.find((c) => c.id === categoryId);
-    if (cat) cat.rollover = rollover ? 1 : 0;
-    await loadDashboard();
-  } catch (err) {
-    showErrorToast(`Failed to update category: ${err.message}`);
-    renderSettings(state.categories); // revert the toggle UI
-  }
+function toggleCategoryInclusion(categoryId, includedInBudget) {
+  return toggleCategoryBoolean(categoryId, includedInBudget, {
+    endpoint: 'inclusion', bodyKey: 'includedInBudget', stateField: 'included_in_budget',
+  });
+}
+
+function toggleCategoryRollover(categoryId, rollover) {
+  return toggleCategoryBoolean(categoryId, rollover, {
+    endpoint: 'rollover', bodyKey: 'rollover', stateField: 'rollover',
+  });
 }
 
 async function deleteCategory(id, name) {

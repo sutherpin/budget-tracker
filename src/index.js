@@ -812,10 +812,10 @@ var index_default = {
         return await handleDeleteCategory(request, env);
       }
       if (/^\/api\/categories\/\d+\/inclusion$/.test(url.pathname) && request.method === "PATCH") {
-        return await handleToggleCategoryInclusion(request, env);
+        return await handleToggleCategoryBoolean(request, env, "inclusion");
       }
       if (/^\/api\/categories\/\d+\/rollover$/.test(url.pathname) && request.method === "PATCH") {
-        return await handleToggleCategoryRollover(request, env);
+        return await handleToggleCategoryBoolean(request, env, "rollover");
       }
       if (/^\/api\/categories\/\d+\/note$/.test(url.pathname) && request.method === "PATCH") {
         return await handleSaveCategoryNote(request, env);
@@ -921,6 +921,7 @@ var index_default = {
     if (event.cron === "*/30 * * * *") {
       ctx.waitUntil(processInStoreReceipts(env, ctx).catch((err) => console.error("Scheduled in-store receipt check failed:", err)));
       ctx.waitUntil(processAmazonReceipts(env, ctx).catch((err) => console.error("Scheduled Amazon receipt check failed:", err)));
+      ctx.waitUntil(processEbayReceipts(env, ctx).catch((err) => console.error("Scheduled eBay receipt check failed:", err)));
     }
   }
 };
@@ -1530,11 +1531,23 @@ function findReceiptAttachmentPart(payload) {
   return null;
 }
 __name(findReceiptAttachmentPart, "findReceiptAttachmentPart");
-async function listUnprocessedAmazonReceiptEmails(accessToken) {
-  const data = await gmailFetch(accessToken, `/messages?q=${encodeURIComponent("subject:Ordered")}`);
+async function listUnprocessedEmailsBySubject(accessToken, subjectQuery) {
+  const data = await gmailFetch(accessToken, `/messages?q=${encodeURIComponent(subjectQuery)}`);
   return (data.messages || []).map((m) => m.id);
 }
+__name(listUnprocessedEmailsBySubject, "listUnprocessedEmailsBySubject");
+async function listUnprocessedAmazonReceiptEmails(accessToken) {
+  return listUnprocessedEmailsBySubject(accessToken, "subject:Ordered");
+}
 __name(listUnprocessedAmazonReceiptEmails, "listUnprocessedAmazonReceiptEmails");
+// eBay forwards come from whichever personal inbox the user forwards from
+// (varies — Jason's primary, sutherfone@gmail, suthertab@gmail), so there's
+// no reliable sender to key off; eBay's own subject line ("Order confirmed:
+// ...") is the one constant regardless of who forwarded it.
+async function listUnprocessedEbayReceiptEmails(accessToken) {
+  return listUnprocessedEmailsBySubject(accessToken, 'subject:"Order confirmed"');
+}
+__name(listUnprocessedEbayReceiptEmails, "listUnprocessedEbayReceiptEmails");
 function getMessageHeader(message, name) {
   return message.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || null;
 }
@@ -1584,7 +1597,7 @@ var RECEIPT_SCHEMA = {
   type: "object",
   properties: {
     isReceipt: { type: "boolean", description: "False if this image/document is not actually a store receipt (e.g. an ad, promo banner, or unrelated attachment)" },
-    merchant: { type: "string", enum: ["walmart", "target", "costco", "amazon", "unknown"], description: "Which store this receipt is from, identified from its visual branding or text" },
+    merchant: { type: "string", enum: ["walmart", "target", "costco", "amazon", "ebay", "unknown"], description: "Which store this receipt is from, identified from its visual branding or text" },
     date: { type: "string", description: "Transaction date converted to strict ISO 8601 (YYYY-MM-DD), regardless of the format printed on the receipt" },
     subtotal: { type: "number" },
     taxTotal: { type: "number" },
@@ -1608,11 +1621,46 @@ var RECEIPT_SCHEMA = {
   required: ["isReceipt", "merchant", "date", "subtotal", "taxTotal", "total", "items"],
   additionalProperties: false
 };
-async function parseAndCategorizeReceipt(env, attachmentBytes, mimeType) {
+async function fetchActiveCategoryNames(env) {
   const { results: categories } = await env.DB.prepare(
     "SELECT name FROM categories WHERE is_active = 1"
   ).all();
-  const categoryNames = categories.map((c) => c.name);
+  return categories.map((c) => c.name);
+}
+__name(fetchActiveCategoryNames, "fetchActiveCategoryNames");
+// Shared boilerplate behind every Claude receipt-parse call (image, PDF, or
+// plain email text) — only the message `content` and an `errorLabel` for
+// logging differ per caller.
+async function callClaudeForReceipt(env, content, errorLabel) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 4096,
+      thinking: { type: "disabled" },
+      output_config: { format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
+      messages: [{ role: "user", content }]
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error(`Claude ${errorLabel} parse failed (${res.status}):`, data);
+    throw new Error(data.error?.message || `Claude ${errorLabel} parse failed`);
+  }
+  const textBlock = data.content.find((b) => b.type === "text");
+  if (!textBlock) {
+    throw new Error("Claude response had no text content block");
+  }
+  return JSON.parse(textBlock.text);
+}
+__name(callClaudeForReceipt, "callClaudeForReceipt");
+async function parseAndCategorizeReceipt(env, attachmentBytes, mimeType) {
+  const categoryNames = await fetchActiveCategoryNames(env);
   const contentBlock = mimeType === "application/pdf"
     ? { type: "document", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } }
     : { type: "image", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(attachmentBytes) } };
@@ -1660,51 +1708,56 @@ Multiplier, Sugar-Free Variety Pack"). If the description is already a normal, c
 leave "friendlyName" as an empty string — don't restate the obvious.
 
 Respond with structured JSON only, matching the given schema.`;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 4096,
-      thinking: { type: "disabled" },
-      output_config: { format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
-      messages: [
-        { role: "user", content: [contentBlock, { type: "text", text: prompt }] }
-      ]
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    console.error(`Claude receipt parse failed (${res.status}):`, data);
-    throw new Error(data.error?.message || "Claude receipt parse failed");
-  }
-  const textBlock = data.content.find((b) => b.type === "text");
-  if (!textBlock) {
-    throw new Error("Claude response had no text content block");
-  }
-  return JSON.parse(textBlock.text);
+  return callClaudeForReceipt(env, [contentBlock, { type: "text", text: prompt }], "receipt");
 }
 __name(parseAndCategorizeReceipt, "parseAndCategorizeReceipt");
-async function parseAndCategorizeAmazonEmail(env, bodyText, emailDateHeader) {
-  const { results: categories } = await env.DB.prepare(
-    "SELECT name FROM categories WHERE is_active = 1"
-  ).all();
-  const categoryNames = categories.map((c) => c.name);
+// Amazon and eBay order-confirmation emails share the same skeleton (decide
+// isReceipt, extract items, categorize, convert the date, respond with the
+// schema) — only the merchant name and its email-format quirks differ, so
+// those are the only two things each caller supplies.
+async function parseAndCategorizeOrderEmail(env, { merchant, merchantLabel, bodyText, emailDateHeader, formatNotes }) {
+  const categoryNames = await fetchActiveCategoryNames(env);
   const prompt = `This is the text of an email forwarded into a receipts inbox that is expected to be
-an Amazon.com order-confirmation email, but since it was manually forwarded, it may contain
+a ${merchantLabel} order-confirmation email, but since it was manually forwarded, it may contain
 forwarding headers, quoted text, or occasionally be something else entirely (a shipping update, an
 unrelated forwarded email, etc.).
 
-First decide: does this email actually contain an Amazon order confirmation with purchased items
-and a grand total? If not, set isReceipt to false and leave the other fields as empty/zero
-placeholders — don't try to force-fit unrelated content into receipt fields. If it is an order
-confirmation, set "merchant" to "amazon".
+First decide: does this email actually contain a ${merchantLabel} order confirmation with purchased
+item(s) and an order total? If not, set isReceipt to false and leave the other fields as
+empty/zero placeholders — don't try to force-fit unrelated content into receipt fields. If it is
+an order confirmation, set "merchant" to "${merchant}".
 
-If it is an order confirmation: extract every ordered line item with its description and price.
+${formatNotes}
+
+Convert the order date to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
+lookups, so it must be a real, correctly converted calendar date. Prefer an explicit order date
+found in the email text itself (e.g. inside a forwarded "Date:"/"Sent:" header or an "Order Placed"
+line) if present; otherwise fall back to this email's received date: ${emailDateHeader || "unknown"}.
+
+Categorize each item into one of these existing budget categories when a reasonable match
+exists: ${categoryNames.join(", ")}.
+If no existing category fits well, choose a short, sensible new category name instead of
+forcing a bad match.
+
+Set each item's "uncertain" flag to true whenever you are not genuinely confident in its
+category — a vague or abbreviated product title, or anything you're guessing at rather than
+reading clearly. Set it to false only when you're confident. Err toward true rather than force a
+bad guess.
+
+Respond with structured JSON only, matching the given schema.
+
+Email text:
+${bodyText}`;
+  return callClaudeForReceipt(env, [{ type: "text", text: prompt }], `${merchantLabel} email`);
+}
+__name(parseAndCategorizeOrderEmail, "parseAndCategorizeOrderEmail");
+async function parseAndCategorizeAmazonEmail(env, bodyText, emailDateHeader) {
+  return parseAndCategorizeOrderEmail(env, {
+    merchant: "amazon",
+    merchantLabel: "Amazon.com",
+    bodyText,
+    emailDateHeader,
+    formatNotes: `If it is an order confirmation: extract every ordered line item with its description and price.
 Amazon order-confirmation emails typically show only a "Grand Total" with no separate subtotal or
 tax line — in that case, set subtotal to the sum of the item prices, and set taxTotal to
 (total - subtotal). If the email does show an explicit subtotal/tax breakdown instead, use those
@@ -1719,57 +1772,33 @@ lacking a product title. When there's no itemized breakdown, create a single ite
 category summary line as its description (e.g. "1 Automotive item"), set its amount to the full
 total, and set "uncertain" to true since the specific product isn't named.
 
-Convert the order date to strict ISO 8601 (YYYY-MM-DD) — this is used for exact-match database
-lookups, so it must be a real, correctly converted calendar date. Prefer an explicit order date
-found in the email text itself (e.g. inside a forwarded "Date:" header or an "Order Placed" line)
-if present; otherwise fall back to this email's received date: ${emailDateHeader || "unknown"}.
-
-Categorize each item into one of these existing budget categories when a reasonable match
-exists: ${categoryNames.join(", ")}.
-If no existing category fits well, choose a short, sensible new category name instead of
-forcing a bad match.
-
-Set each item's "uncertain" flag to true whenever you are not genuinely confident in its
-category — a vague or abbreviated product title, or anything you're guessing at rather than
-reading clearly. Set it to false only when you're confident. Err toward true rather than force a
-bad guess.
-
 Amazon listing titles are already full product names, so leave "friendlyName" as an empty string
-for every item — there's nothing cryptic here to translate.
-
-Respond with structured JSON only, matching the given schema.
-
-Email text:
-${bodyText}`;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 4096,
-      thinking: { type: "disabled" },
-      output_config: { format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
-      messages: [
-        { role: "user", content: [{ type: "text", text: prompt }] }
-      ]
-    })
+for every item — there's nothing cryptic here to translate.`
   });
-  const data = await res.json();
-  if (!res.ok) {
-    console.error(`Claude Amazon email parse failed (${res.status}):`, data);
-    throw new Error(data.error?.message || "Claude Amazon email parse failed");
-  }
-  const textBlock = data.content.find((b) => b.type === "text");
-  if (!textBlock) {
-    throw new Error("Claude response had no text content block");
-  }
-  return JSON.parse(textBlock.text);
 }
 __name(parseAndCategorizeAmazonEmail, "parseAndCategorizeAmazonEmail");
+async function parseAndCategorizeEbayEmail(env, bodyText, emailDateHeader) {
+  return parseAndCategorizeOrderEmail(env, {
+    merchant: "ebay",
+    merchantLabel: "eBay",
+    bodyText,
+    emailDateHeader,
+    formatNotes: `eBay's order-confirmation email lists each item's title, price, item ID, order number, and seller
+name/address, followed by an "Order total" breakdown with explicit "Subtotal", "Shipping" (often
+"Free"), "Sales tax", and "Total charged to [card] x-####" lines. This is more detailed than a
+typical receipt: use the printed Subtotal/Sales tax/Total values directly rather than summing
+items yourself, and use the "Total charged" line as the grand total (this is what actually posted
+to the card, and is what must match the bank transaction). A single email can confirm an order
+containing multiple distinct items purchased together — extract every item listed, each as its
+own entry, not just the first one.
+
+eBay listing titles are sometimes truncated with "..." in the subject line but the full title is
+printed in the email body — use the full body text version. Titles are already full, real product
+descriptions, so leave "friendlyName" as an empty string for every item — there's nothing cryptic
+here to translate.`
+  });
+}
+__name(parseAndCategorizeEbayEmail, "parseAndCategorizeEbayEmail");
 var RECEIPT_SOURCES = {
   // Bank/CSV feeds render the same store under wildly different raw
   // descriptors depending on register/terminal ("POS WAL-MART #3380...",
@@ -1780,6 +1809,7 @@ var RECEIPT_SOURCES = {
     merchantRegex: /wal[\s-]?mart|wm\s*supercenter/i
   },
   amazon: { merchantLikePatterns: ["%amazon%"], merchantRegex: /amazon/i },
+  ebay: { merchantLikePatterns: ["%ebay%"], merchantRegex: /ebay/i },
   target: { merchantLikePatterns: ["%target%"], merchantRegex: /target/i },
   // "POS COSTCO WHSE #0486..." is the raw terminal descriptor seen from CSV
   // imports; "Costco" alone is what Plaid/SMS report.
@@ -2174,25 +2204,41 @@ async function processInStoreReceipts(env, ctx) {
   });
 }
 __name(processInStoreReceipts, "processInStoreReceipts");
-async function processAmazonReceipts(env, ctx) {
-  return processReceiptEmails(env, ctx, "amazon", {
-    listCandidateIds: listUnprocessedAmazonReceiptEmails,
+// Every "order confirmation email" source (Amazon, eBay, ...) shares the
+// exact same extraction shape — pull the body text, pull the Date header,
+// hand both to that merchant's parse function. Only listCandidateIds and
+// parseEmailFn actually differ per source.
+function processOrderEmailReceipts(env, ctx, source, listCandidateIds, parseEmailFn) {
+  return processReceiptEmails(env, ctx, source, {
+    listCandidateIds,
     extractAndParse: async (accessToken, message) => {
       const bodyText = extractEmailBodyText(message.payload);
       if (!bodyText) return { skip: true, status: "no_body_text" };
       const dateHeader = getMessageHeader(message, "Date");
-      const parsed = await parseAndCategorizeAmazonEmail(env, bodyText, dateHeader);
+      const parsed = await parseEmailFn(env, bodyText, dateHeader);
       return { parsed };
     }
   });
 }
+__name(processOrderEmailReceipts, "processOrderEmailReceipts");
+function processAmazonReceipts(env, ctx) {
+  return processOrderEmailReceipts(env, ctx, "amazon", listUnprocessedAmazonReceiptEmails, parseAndCategorizeAmazonEmail);
+}
 __name(processAmazonReceipts, "processAmazonReceipts");
+function processEbayReceipts(env, ctx) {
+  return processOrderEmailReceipts(env, ctx, "ebay", listUnprocessedEbayReceiptEmails, parseAndCategorizeEbayEmail);
+}
+__name(processEbayReceipts, "processEbayReceipts");
 async function runAllReceiptSources(env, ctx) {
-  const [inStore, amazon] = await Promise.all([
+  const [inStore, amazon, ebay] = await Promise.all([
     processInStoreReceipts(env, ctx),
-    processAmazonReceipts(env, ctx)
+    processAmazonReceipts(env, ctx),
+    processEbayReceipts(env, ctx)
   ]);
-  return { count: inStore.count + amazon.count, results: [...inStore.results, ...amazon.results] };
+  return {
+    count: inStore.count + amazon.count + ebay.count,
+    results: [...inStore.results, ...amazon.results, ...ebay.results]
+  };
 }
 __name(runAllReceiptSources, "runAllReceiptSources");
 async function handleReceiptCheckNow(request, env, ctx) {
@@ -2210,7 +2256,7 @@ async function handleReceiptSyncNow(env, ctx) {
 __name(handleReceiptSyncNow, "handleReceiptSyncNow");
 async function handleReceiptStatus(env) {
   const { results: runRows } = await env.DB.prepare(
-    "SELECT source, last_run_at, last_run_count FROM receipt_job_runs WHERE source IN ('walmart', 'amazon')"
+    "SELECT source, last_run_at, last_run_count FROM receipt_job_runs WHERE source IN ('walmart', 'amazon', 'ebay')"
   ).all();
   const lastRunAt = runRows.reduce((max, r) => (r.last_run_at && (!max || r.last_run_at > max) ? r.last_run_at : max), null);
   const lastRunCount = runRows.some((r) => r.last_run_count != null)
@@ -2249,12 +2295,8 @@ async function handleGetReceiptMatchCandidates(env, receiptId) {
 }
 __name(handleGetReceiptMatchCandidates, "handleGetReceiptMatchCandidates");
 async function handleMatchReceiptToTransaction(request, env, ctx, receiptId) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { transactionId } = body;
   if (!transactionId) return jsonResponse({ error: "transactionId is required" }, 400);
   const receipt = await env.DB.prepare(
@@ -2334,12 +2376,8 @@ async function handleGetReturnCandidates(env, merchant, amount) {
 }
 __name(handleGetReturnCandidates, "handleGetReturnCandidates");
 async function handleResolveReturn(request, env, ctx, transactionId) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { candidateId, categoryId: directCategoryId } = body;
   if (!candidateId && !directCategoryId) return jsonResponse({ error: "candidateId or categoryId is required" }, 400);
   if (!candidateId) {
@@ -2428,8 +2466,7 @@ async function handleGetDuplicates(env) {
 }
 __name(handleGetDuplicates, "handleGetDuplicates");
 async function handleDismissDuplicate(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const flagId = parts[parts.length - 2];
+  const flagId = idFromPath(request, 2);
   await env.DB.prepare("UPDATE duplicate_flags SET resolved = 1 WHERE id = ?").bind(flagId).run();
   return jsonResponse({ success: true });
 }
@@ -2463,12 +2500,8 @@ async function handleGetCsvImportDuplicates(env) {
 }
 __name(handleGetCsvImportDuplicates, "handleGetCsvImportDuplicates");
 async function handleResolveCsvImportDuplicate(request, env, ctx, duplicateId) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { action } = body;
   if (action !== "skip" && action !== "import") {
     return jsonResponse({ error: "action must be 'skip' or 'import'" }, 400);
@@ -2519,12 +2552,8 @@ async function handlePending(env) {
 }
 __name(handlePending, "handlePending");
 async function handleCategorize(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { transactionId, categoryId } = body;
   if (!transactionId || !categoryId) {
     return jsonResponse({ error: "transactionId and categoryId required" }, 400);
@@ -2941,6 +2970,26 @@ function jsonResponse(data, status = 200) {
     }
   });
 }
+// Every PATCH/POST handler needs the same "parse the JSON body, 400 on
+// malformed JSON" boilerplate — usage: `const { body, error } =
+// await parseJsonBody(request); if (error) return error;`
+async function parseJsonBody(request, errorMessage = "Invalid JSON body") {
+  try {
+    return { body: await request.json() };
+  } catch {
+    return { error: jsonResponse({ error: errorMessage }, 400) };
+  }
+}
+__name(parseJsonBody, "parseJsonBody");
+// Every handler keyed off an ID embedded in the URL path (e.g.
+// /api/categories/:id or /api/categories/:id/rollover) repeats this same
+// split-and-index lookup — `fromEnd` picks how many segments from the end
+// the ID sits (1 for a trailing ID, 2 when a sub-resource segment follows it).
+function idFromPath(request, fromEnd = 1) {
+  const parts = new URL(request.url).pathname.split("/");
+  return parts[parts.length - fromEnd];
+}
+__name(idFromPath, "idFromPath");
 __name(jsonResponse, "jsonResponse");
 async function handleTestDatabaseConnection(env) {
   try {
@@ -2963,12 +3012,8 @@ async function handleTestTransactions(env) {
 }
 __name(handleTestTransactions, "handleTestTransactions");
 async function handleSaveBudget(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request, "Invalid JSON");
+  if (bodyError) return bodyError;
   const { categoryId, month, amount } = body;
   if (!categoryId || !month || amount === void 0) {
     return jsonResponse({ error: "categoryId, month, and amount required" }, 400);
@@ -2982,12 +3027,8 @@ async function handleSaveBudget(request, env) {
 }
 __name(handleSaveBudget, "handleSaveBudget");
 async function handleAddCategory(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request, "Invalid JSON");
+  if (bodyError) return bodyError;
   const { name, icon, color } = body;
   if (!name) return jsonResponse({ error: "name required" }, 400);
   await env.DB.prepare(
@@ -2997,8 +3038,7 @@ async function handleAddCategory(request, env) {
 }
 __name(handleAddCategory, "handleAddCategory");
 async function handleDeleteCategory(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 1];
+  const id = idFromPath(request, 1);
   if (!id) {
     return jsonResponse({ error: "ID is required" }, 400);
   }
@@ -3006,62 +3046,38 @@ async function handleDeleteCategory(request, env) {
   return jsonResponse({ success: true });
 }
 __name(handleDeleteCategory, "handleDeleteCategory");
-async function handleToggleCategoryInclusion(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 2];
+// Both category boolean toggles (include-in-budget, rollover) are the same
+// operation on a different column/body-key — a config lookup keyed by the
+// route's toggleKey is all that actually varies between them.
+var CATEGORY_BOOLEAN_TOGGLES = {
+  inclusion: { column: "included_in_budget", bodyKey: "includedInBudget" },
+  rollover: { column: "rollover", bodyKey: "rollover" }
+};
+async function handleToggleCategoryBoolean(request, env, toggleKey) {
+  const { column, bodyKey } = CATEGORY_BOOLEAN_TOGGLES[toggleKey];
+  const id = idFromPath(request, 2);
   if (!id) {
     return jsonResponse({ error: "ID is required" }, 400);
   }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
-  const { includedInBudget } = body;
-  if (typeof includedInBudget !== "boolean") {
-    return jsonResponse({ error: "includedInBudget (boolean) is required" }, 400);
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
+  const value = body[bodyKey];
+  if (typeof value !== "boolean") {
+    return jsonResponse({ error: `${bodyKey} (boolean) is required` }, 400);
   }
   await env.DB.prepare(
-    `UPDATE categories SET included_in_budget = ? WHERE id = ?`
-  ).bind(includedInBudget ? 1 : 0, id).run();
+    `UPDATE categories SET ${column} = ? WHERE id = ?`
+  ).bind(value ? 1 : 0, id).run();
   return jsonResponse({ success: true });
 }
-__name(handleToggleCategoryInclusion, "handleToggleCategoryInclusion");
-async function handleToggleCategoryRollover(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 2];
-  if (!id) {
-    return jsonResponse({ error: "ID is required" }, 400);
-  }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
-  const { rollover } = body;
-  if (typeof rollover !== "boolean") {
-    return jsonResponse({ error: "rollover (boolean) is required" }, 400);
-  }
-  await env.DB.prepare(
-    `UPDATE categories SET rollover = ? WHERE id = ?`
-  ).bind(rollover ? 1 : 0, id).run();
-  return jsonResponse({ success: true });
-}
-__name(handleToggleCategoryRollover, "handleToggleCategoryRollover");
+__name(handleToggleCategoryBoolean, "handleToggleCategoryBoolean");
 async function handleSaveCategoryNote(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 2];
+  const id = idFromPath(request, 2);
   if (!id) {
     return jsonResponse({ error: "ID is required" }, 400);
   }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { month, note } = body;
   if (!month) {
     return jsonResponse({ error: "month is required" }, 400);
@@ -3075,17 +3091,12 @@ async function handleSaveCategoryNote(request, env) {
 }
 __name(handleSaveCategoryNote, "handleSaveCategoryNote");
 async function handleEditCategory(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 1];
+  const id = idFromPath(request, 1);
   if (!id) {
     return jsonResponse({ error: "ID is required" }, 400);
   }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { name, icon, color } = body;
   if (!name) {
     return jsonResponse({ error: "name is required" }, 400);
@@ -3099,12 +3110,8 @@ async function handleEditCategory(request, env) {
 }
 __name(handleEditCategory, "handleEditCategory");
 async function handleAddRecurringTransaction(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request, "Invalid JSON");
+  if (bodyError) return bodyError;
   const { name, amount, categoryId, dayOfMonth, startDate, endDate } = body;
   if (!name || amount === void 0 || !categoryId || !dayOfMonth || !startDate) {
     return jsonResponse({ error: "name, amount, categoryId, dayOfMonth, and startDate are required" }, 400);
@@ -3150,8 +3157,7 @@ async function handleGetRecurringTransactions(env) {
 }
 __name(handleGetRecurringTransactions, "handleGetRecurringTransactions");
 async function handleDeleteRecurringTransaction(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const id = parts[parts.length - 1];
+  const id = idFromPath(request, 1);
   if (!id) {
     return jsonResponse({ error: "ID is required" }, 400);
   }
@@ -3160,12 +3166,8 @@ async function handleDeleteRecurringTransaction(request, env) {
 }
 __name(handleDeleteRecurringTransaction, "handleDeleteRecurringTransaction");
 async function handleAddManualTransaction(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request, "Invalid JSON");
+  if (bodyError) return bodyError;
   const { description, amount, categoryId, date, autoCategorize } = body;
   if (!description || amount === void 0 || !date) {
     return jsonResponse({ error: "description, amount, and date are required" }, 400);
@@ -3189,12 +3191,8 @@ async function handleAddManualTransaction(request, env) {
 }
 __name(handleAddManualTransaction, "handleAddManualTransaction");
 async function handlePushSubscribe(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request, "Invalid JSON");
+  if (bodyError) return bodyError;
   const { endpoint, keys } = body;
   if (!endpoint || !keys?.p256dh || !keys?.auth) {
     return jsonResponse({ error: "endpoint and keys required" }, 400);
@@ -3312,17 +3310,12 @@ async function handleGetSingleTransaction(env, transactionId) {
 }
 __name(handleGetSingleTransaction, "handleGetSingleTransaction");
 async function handleUpdateTransactionNotes(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const transactionId = parts[parts.length - 1];
+  const transactionId = idFromPath(request, 1);
   if (!transactionId) {
     return jsonResponse({ error: "Transaction ID is required" }, 400);
   }
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { notes, categoryId } = body;
   if (notes === void 0) {
     return jsonResponse({ error: "notes field is required" }, 400);
@@ -3372,14 +3365,9 @@ async function handleUpdateTransactionNotes(request, env) {
 }
 __name(handleUpdateTransactionNotes, "handleUpdateTransactionNotes");
 async function handleSplitTransaction(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const transactionId = parts[parts.length - 2];
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const transactionId = idFromPath(request, 2);
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const splits = body.splits;
   if (!Array.isArray(splits) || splits.length < 2 || splits.length > 3) {
     return jsonResponse({ error: "Provide 2 or 3 splits" }, 400);
@@ -3415,12 +3403,8 @@ __name(handleSplitTransaction, "handleSplitTransaction");
 // pipeline uses, just with user-chosen categoryIds instead of resolved
 // labels.
 async function handleCategorizeTransactionItems(request, env, transactionId) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "Invalid JSON body" }, 400);
-  }
+  const { body, error: bodyError } = await parseJsonBody(request);
+  if (bodyError) return bodyError;
   const { categoryIds } = body;
   if (!Array.isArray(categoryIds) || !categoryIds.length) {
     return jsonResponse({ error: "categoryIds array is required" }, 400);
@@ -3463,8 +3447,7 @@ async function handleCategorizeTransactionItems(request, env, transactionId) {
 }
 __name(handleCategorizeTransactionItems, "handleCategorizeTransactionItems");
 async function handleUnsplitTransaction(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const transactionId = parts[parts.length - 2];
+  const transactionId = idFromPath(request, 2);
   await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
   await env.DB.prepare(
     "UPDATE transactions SET is_split = 0, category_id = NULL, status = 'pending', categorized_at = NULL WHERE id = ?"
@@ -3473,8 +3456,7 @@ async function handleUnsplitTransaction(request, env) {
 }
 __name(handleUnsplitTransaction, "handleUnsplitTransaction");
 async function handleDeleteTransaction(request, env) {
-  const parts = new URL(request.url).pathname.split("/");
-  const transactionId = parts[parts.length - 1];
+  const transactionId = idFromPath(request, 1);
   if (!transactionId) {
     return jsonResponse({ error: "Transaction ID is required" }, 400);
   }
