@@ -2122,6 +2122,32 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
       const effectiveSource = parsed.merchant && parsed.merchant !== "unknown" && RECEIPT_SOURCES[parsed.merchant]
         ? parsed.merchant
         : source;
+      // Same receipt forwarded/scanned twice arrives as two distinct Gmail
+      // messages, so the gmail_message_id dedup above never catches it. Catch
+      // it here by content instead — same merchant/total/date already
+      // recorded — before it gets anywhere near transaction matching, so a
+      // re-scan can never masquerade as a second real purchase or a "conflict"
+      // needing the user's attention.
+      const priorReceipt = await env.DB.prepare(
+        `SELECT id, matched_transaction_id FROM processed_receipt_emails
+        WHERE source = ? AND receipt_total = ? AND receipt_date = ?
+          AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete')
+        LIMIT 1`
+      ).bind(effectiveSource, parsed.total, parsed.date).first();
+      if (priorReceipt) {
+        await recordProcessedReceiptEmail(env, {
+          messageId,
+          source: effectiveSource,
+          status: "duplicate_receipt",
+          receiptTotal: parsed.total,
+          receiptDate: parsed.date,
+          parsedJson: parsed,
+          matchedTransactionId: priorReceipt.matched_transaction_id ?? null,
+          detail: `Duplicate of receipt #${priorReceipt.id} (same ${effectiveSource} total/date) — ignored`
+        });
+        summary.push({ messageId, status: "duplicate_receipt" });
+        continue;
+      }
       const txn = await findMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
       if (!txn) {
         // No still-pending transaction to attach to. Distinguish "one exists
