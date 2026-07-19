@@ -1760,7 +1760,10 @@ function renderSettings(categories) {
   list.innerHTML = '';
   categories.forEach((cat) => {
     const existing = state.dashboard.categories?.find((c) => c.categoryId === cat.id);
-    const amount = existing?.allotted || 0;
+    // Always the raw stored budget, never the rollover-adjusted display
+    // total shown on the dashboard — editing/saving here must not bake an
+    // accumulated rollover surplus into next month's base amount.
+    const amount = existing?.baseAllotted || 0;
     const included = cat.included_in_budget === undefined ? true : !!cat.included_in_budget;
     const rollover = !!cat.rollover;
     const row = document.createElement('div');
@@ -1796,7 +1799,10 @@ function renderSettings(categories) {
       <button class="btn-delete-cat" data-cat-id="${cat.id}">🗑️</button>
     `;
     const input = row.querySelector('.settings-input');
-    input.addEventListener('input', scheduleSaveBudgets);
+    input.addEventListener('input', () => {
+      input.dataset.dirty = '1';
+      scheduleSaveBudgets();
+    });
 
     const toggleInput = row.querySelector('.settings-toggle-input');
     toggleInput.addEventListener('change', () => toggleCategoryInclusion(cat.id, toggleInput.checked));
@@ -1952,7 +1958,12 @@ function scheduleSaveBudgets() {
 
 async function saveBudgets() {
   clearTimeout(saveBudgetsTimer);
-  const inputs = document.querySelectorAll('.settings-input[data-cat-id]');
+  // Only send inputs the user actually touched (see the 'input' listener in
+  // renderSettings) — every field here is pre-filled from baseAllotted, but
+  // re-saving an untouched field is still worth avoiding on principle, since
+  // any future drift between "displayed" and "raw" would otherwise get
+  // silently baked back in the moment any other field is edited.
+  const inputs = document.querySelectorAll('.settings-input[data-cat-id][data-dirty="1"]');
   const month = state.currentMonth;
   const saves = Array.from(inputs).map((el) =>
     apiFetch('/api/budget', {
@@ -1965,8 +1976,10 @@ async function saveBudgets() {
       }),
     })
   );
+  if (!saves.length) return;
   try {
     await Promise.all(saves);
+    inputs.forEach((el) => delete el.dataset.dirty);
     const btn = document.getElementById('btn-save-budgets');
     btn.textContent = 'Saved ✓';
     btn.style.background = '#22c55e';
@@ -2327,7 +2340,10 @@ async function openNotesModal(transaction) {
     modalCard.classList.add('modal-card-expanded');
     document.getElementById('notes-category-editor').classList.add('hidden');
     document.getElementById('notes-items-editor').classList.remove('hidden');
-    renderItemCategoryRows(document.getElementById('notes-item-rows'), txn.receiptItems);
+    renderItemCategoryRows(document.getElementById('notes-item-rows'), txn.receiptItems, {
+      transactionId: txn.id,
+      returnable: txn.source === 'sms',
+    });
     return;
   }
 
@@ -2411,10 +2427,10 @@ async function openSplitModal() {
 // the parsed/suggested category — used inline in the notes modal for any
 // receipt-backed transaction, so a manual re-categorization is always just
 // as available as the original auto-categorized guess.
-function renderItemCategoryRows(containerEl, items) {
+function renderItemCategoryRows(containerEl, items, { transactionId, returnable } = {}) {
   containerEl.innerHTML = '';
   const categoryOptions = state.categories.map((cat) => `<option value="${cat.id}">${cat.icon} ${cat.name}</option>`).join('');
-  items.forEach((item) => {
+  items.forEach((item, index) => {
     const row = document.createElement('div');
     row.className = 'split-item-row';
     row.innerHTML = `
@@ -2427,10 +2443,45 @@ function renderItemCategoryRows(containerEl, items) {
         <option value="">Choose category</option>
         ${categoryOptions}
       </select>
+      ${returnable ? '<button type="button" class="btn-return-item" title="Mark item as returned">↩️</button>' : ''}
     `;
     row.querySelector('select').value = item.categoryId || '';
+    if (returnable) {
+      row.querySelector('.btn-return-item').addEventListener('click', () => returnTransactionItem(transactionId, index, item, items.length));
+    }
     containerEl.appendChild(row);
   });
+}
+
+// Only offered for SMS-sourced transactions (a card Plaid/CSV never sees) —
+// see transactionSource on the backend for why every other source is
+// expected to reconcile through its own refund transaction instead.
+async function returnTransactionItem(transactionId, itemIndex, item, itemCount) {
+  const isLastItem = itemCount === 1;
+  const confirmMessage = isLastItem
+    ? `Mark "${item.description}" (${fmt(item.amount)}) as returned? This is the only item on the receipt, so the whole $${item.amount.toFixed(2)} transaction will be deleted.`
+    : `Mark "${item.description}" (${fmt(item.amount)}) as returned? It'll be removed from this transaction and your budget.`;
+  if (!confirm(confirmMessage)) return;
+
+  try {
+    const result = await apiFetch(`/api/transactions/${transactionId}/items/${itemIndex}/return`, { method: 'POST' });
+    if (result.deleted) {
+      closeNotesModal();
+      showHeaderStatus('✓ Item returned — transaction removed (it was the only item)');
+    } else {
+      showHeaderStatus(`✓ Item returned — transaction reduced to ${fmt(result.newAmount)}`);
+      const refreshed = await apiFetch(`/api/transactions/${transactionId}`);
+      state.currentTxn = refreshed;
+      document.getElementById('notes-amount').textContent = fmt(refreshed.amount);
+      renderItemCategoryRows(document.getElementById('notes-item-rows'), refreshed.receiptItems, {
+        transactionId: refreshed.id,
+        returnable: refreshed.source === 'sms',
+      });
+    }
+    await refreshAfterTransactionChange();
+  } catch (err) {
+    showErrorToast(`Failed to mark item as returned: ${err.message}`);
+  }
 }
 
 async function categorizeSplitAsSingleCategory() {

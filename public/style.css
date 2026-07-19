@@ -1686,6 +1686,21 @@ html, body {
   cursor: pointer;
   padding: 0 4px;
 }
+.btn-return-item {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 6px 8px;
+}
+.btn-return-item:hover {
+  background: var(--danger);
+  color: var(--bg);
+}
 .split-item-rows {
   display: flex;
   flex-direction: column;

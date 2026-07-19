@@ -546,6 +546,20 @@ async function resolveCategoryIdByLabel(env, label) {
   return insert.meta.last_row_id;
 }
 __name(resolveCategoryIdByLabel, "resolveCategoryIdByLabel");
+// Not stored as an explicit column — derived from how the row was ingested.
+// Plaid rows always carry a plaid_transaction_id; CSV/manual inserts each
+// prefix raw_sms with their own tag (see insertCsvTransaction /
+// handleAddManualTransaction). Anything left over came in through the Gesa
+// SMS webhook, i.e. a card that isn't synced through Plaid at all — the only
+// case where a return/cancellation refund will never show up as its own
+// transaction for us to match against.
+function transactionSource(txn) {
+  if (txn.plaid_transaction_id) return "plaid";
+  if (txn.raw_sms?.startsWith("CSV:")) return "csv";
+  if (txn.raw_sms?.startsWith("Manual:")) return "manual";
+  return "sms";
+}
+__name(transactionSource, "transactionSource");
 var MANUAL_ONLY_MERCHANT_PATTERNS = [];
 async function suggestCategoryId(env, merchant, rawText) {
   // Walmart/Amazon are categorized exclusively via the receipt-matching
@@ -858,6 +872,9 @@ var index_default = {
       }
       if (/^\/api\/transactions\/\d+\/categorize-items$/.test(url.pathname) && request.method === "POST") {
         return await handleCategorizeTransactionItems(request, env, url.pathname.split("/")[3]);
+      }
+      if (/^\/api\/transactions\/\d+\/items\/\d+\/return$/.test(url.pathname) && request.method === "POST") {
+        return await handleReturnTransactionItem(env, url.pathname.split("/")[3], url.pathname.split("/")[5]);
       }
       if (url.pathname.startsWith("/api/transactions/") && request.method === "PATCH") {
         return await handleUpdateTransactionNotes(request, env);
@@ -2864,21 +2881,33 @@ __name(handleCategories, "handleCategories");
 // time (mirrors an envelope/YNAB-style running balance). Recomputed fresh
 // from full history each call rather than cached, since a category can be
 // re-categorized or a past transaction edited at any time.
+//
+// ROLLOVER_HISTORY_START_MONTH: a one-time epoch, not a general design
+// constraint. A prior bug (Settings saving the rollover-inflated display
+// number back as the next month's raw base) had already contaminated stored
+// budgets with years of bogus accumulated rollover by the time it was found
+// and fixed on 2026-07-19 — so history before that fix shipped is excluded
+// from the walk rather than trusted.
+var ROLLOVER_HISTORY_START_MONTH = "2026-07";
 async function computeRolloverAdjustedAllotted(env, categoryId, targetMonth, baseAllottedForTargetMonth) {
   const { results: monthRows } = await env.DB.prepare(
     `SELECT DISTINCT month FROM (
-      SELECT month FROM budgets WHERE category_id = ? AND month < ?
+      SELECT month FROM budgets WHERE category_id = ? AND month < ? AND month >= ?
       UNION
       SELECT strftime('%Y-%m', occurred_at) AS month FROM transactions
         WHERE category_id = ? AND transaction_type = 'purchase' AND status = 'categorized' AND is_split = 0
-          AND strftime('%Y-%m', occurred_at) < ?
+          AND strftime('%Y-%m', occurred_at) < ? AND strftime('%Y-%m', occurred_at) >= ?
       UNION
       SELECT strftime('%Y-%m', t.occurred_at) AS month FROM transaction_splits ts
         JOIN transactions t ON t.id = ts.transaction_id
         WHERE ts.category_id = ? AND t.transaction_type = 'purchase' AND t.status = 'categorized'
-          AND strftime('%Y-%m', t.occurred_at) < ?
+          AND strftime('%Y-%m', t.occurred_at) < ? AND strftime('%Y-%m', t.occurred_at) >= ?
     ) ORDER BY month ASC`
-  ).bind(categoryId, targetMonth, categoryId, targetMonth, categoryId, targetMonth).all();
+  ).bind(
+    categoryId, targetMonth, ROLLOVER_HISTORY_START_MONTH,
+    categoryId, targetMonth, ROLLOVER_HISTORY_START_MONTH,
+    categoryId, targetMonth, ROLLOVER_HISTORY_START_MONTH
+  ).all();
 
   let rolloverBalance = 0;
   for (const { month } of monthRows) {
@@ -2945,11 +2974,17 @@ async function handleDashboard(env, url) {
   ).bind(month, month, month, month).all();
   console.log("Raw dashboard results:", results);
   const summary = await Promise.all(results.map(async (row) => {
+    // baseAllotted is always the raw stored budgets.allotted_amount — the
+    // Settings screen edits/saves this, never the rollover-inflated
+    // "allotted" below. Conflating the two previously let a save from
+    // Settings write the rollover-adjusted display number back as next
+    // month's base, compounding the rollover into itself every time any
+    // budget field was edited.
     if (!row.rollover) {
-      return { ...row, remaining: row.allotted - row.spent };
+      return { ...row, baseAllotted: row.allotted, remaining: row.allotted - row.spent };
     }
     const { allotted, rolledOver } = await computeRolloverAdjustedAllotted(env, row.categoryId, month, row.allotted);
-    return { ...row, allotted, rolledOver, remaining: allotted - row.spent };
+    return { ...row, baseAllotted: row.allotted, allotted, rolledOver, remaining: allotted - row.spent };
   }));
 
   // Excludes internal self-transfers (e.g. "Withdrawal INTERNET XFR TO SAVGS") —
@@ -3303,6 +3338,7 @@ __name(handleGetTransactions, "handleGetTransactions");
 async function handleGetSingleTransaction(env, transactionId) {
   const txn = await env.DB.prepare(
     `SELECT t.id, t.amount, t.merchant, t.occurred_at, t.status, t.is_split, t.plaid_pending,
+    t.raw_sms, t.plaid_transaction_id,
     COALESCE(n.notes, '') AS notes,
     c.id AS category_id, c.name AS category_name, c.icon, c.color
     FROM transactions t
@@ -3311,6 +3347,9 @@ async function handleGetSingleTransaction(env, transactionId) {
     WHERE t.id = ?`
   ).bind(transactionId).first();
   if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  txn.source = transactionSource(txn);
+  delete txn.raw_sms;
+  delete txn.plaid_transaction_id;
   const [withSplits] = await attachSplits(env, [txn]);
   // A receipt (matched, needs_review, or already_complete/flagged-for-review)
   // is always offered as a manual per-item recategorization option, even
@@ -3472,6 +3511,87 @@ async function handleCategorizeTransactionItems(request, env, transactionId) {
   return jsonResponse({ success: true, entries, summary });
 }
 __name(handleCategorizeTransactionItems, "handleCategorizeTransactionItems");
+// Only meaningful for SMS-sourced transactions (see transactionSource) — a
+// Plaid/CSV-tracked card will eventually show the refund as its own credit
+// transaction, handled by the existing return-matching flow
+// (findReturnCandidates/handleResolveReturn). A card that only ever reaches
+// us via SMS will never produce that credit, so the only way to keep the
+// budget honest is to shrink this transaction (and its splits) directly.
+async function handleReturnTransactionItem(env, transactionId, itemIndexRaw) {
+  const txn = await env.DB.prepare("SELECT * FROM transactions WHERE id = ?").bind(transactionId).first();
+  if (!txn) return jsonResponse({ error: "Transaction not found" }, 404);
+  if (transactionSource(txn) !== "sms") {
+    return jsonResponse({ error: "Item returns are only supported for card transactions that arrived via SMS — anything Plaid/CSV-tracked will reconcile through its own refund transaction instead." }, 403);
+  }
+  const receipt = await env.DB.prepare(
+    "SELECT * FROM processed_receipt_emails WHERE matched_transaction_id = ? ORDER BY id DESC LIMIT 1"
+  ).bind(transactionId).first();
+  if (!receipt || !receipt.parsed_json) return jsonResponse({ error: "No receipt items found for this transaction" }, 404);
+  const parsed = JSON.parse(receipt.parsed_json);
+  const itemIndex = Number(itemIndexRaw);
+  const item = parsed.items?.[itemIndex];
+  if (!item) return jsonResponse({ error: "Item not found on receipt" }, 404);
+
+  if (parsed.items.length === 1) {
+    // The only item on the receipt — returning it empties the whole
+    // purchase, so just delete the transaction (same cleanup order as
+    // handleDeleteTransaction, since the FK constraints are the same).
+    await env.DB.prepare("DELETE FROM transaction_notes WHERE transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare("DELETE FROM duplicate_flags WHERE transaction_id = ? OR matched_transaction_id = ?").bind(transactionId, transactionId).run();
+    await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare("DELETE FROM auto_categorization_log WHERE transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare("DELETE FROM matched_returns WHERE return_transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare("UPDATE processed_receipt_emails SET matched_transaction_id = NULL WHERE matched_transaction_id = ?").bind(transactionId).run();
+    await env.DB.prepare("DELETE FROM transactions WHERE id = ?").bind(transactionId).run();
+    return jsonResponse({ success: true, deleted: true });
+  }
+
+  // Same proportional-tax math findReturnCandidates already uses to price a
+  // single returned item — receipts only ever give a receipt-wide tax total.
+  const taxRate = parsed.subtotal > 0 ? parsed.taxTotal / parsed.subtotal : 0;
+  const itemAmountWithTax = Math.round(item.amount * (1 + taxRate) * 100) / 100;
+  const newAmount = Math.round((txn.amount - itemAmountWithTax) * 100) / 100;
+  const updatedItems = parsed.items.filter((_, i) => i !== itemIndex);
+  const newSubtotal = Math.round((parsed.subtotal - item.amount) * 100) / 100;
+  const newTaxTotal = Math.round((parsed.taxTotal - item.amount * taxRate) * 100) / 100;
+
+  const labelToId = /* @__PURE__ */ new Map();
+  const entries = await computeCategorySplitEntries(updatedItems, newSubtotal, newTaxTotal, newAmount, async (i) => {
+    let categoryId = labelToId.get(i.category);
+    if (categoryId === void 0) {
+      categoryId = await resolveCategoryIdByLabel(env, i.category);
+      labelToId.set(i.category, categoryId);
+    }
+    return categoryId;
+  });
+  await env.DB.prepare("UPDATE transactions SET amount = ? WHERE id = ?").bind(newAmount, transactionId).run();
+  await applyCategorySplitEntries(env, transactionId, entries);
+
+  // matched_returns rows reference this receipt's items by array index — once
+  // one is spliced out, every later index shifts down and would silently
+  // point at the wrong item.
+  await env.DB.prepare("DELETE FROM matched_returns WHERE receipt_id = ? AND item_index = ?").bind(receipt.id, itemIndex).run();
+  await env.DB.prepare(
+    "UPDATE matched_returns SET item_index = item_index - 1 WHERE receipt_id = ? AND item_index > ?"
+  ).bind(receipt.id, itemIndex).run();
+
+  const updatedParsed = { ...parsed, items: updatedItems, subtotal: newSubtotal, taxTotal: newTaxTotal, total: newAmount };
+  await env.DB.prepare(
+    "UPDATE processed_receipt_emails SET parsed_json = ?, receipt_total = ?, status = 'matched', detail = ? WHERE id = ?"
+  ).bind(
+    JSON.stringify(updatedParsed),
+    newAmount,
+    `Item returned: ${item.description} ($${itemAmountWithTax.toFixed(2)}) — transaction reduced to $${newAmount.toFixed(2)}`,
+    receipt.id
+  ).run();
+  await appendAutoGeneratedNote(
+    env,
+    transactionId,
+    `🔁 Item returned: ${item.description} ($${itemAmountWithTax.toFixed(2)} incl. tax) — removed from ${item.category}, transaction amount reduced from $${txn.amount.toFixed(2)} to $${newAmount.toFixed(2)}`
+  );
+  return jsonResponse({ success: true, deleted: false, newAmount });
+}
+__name(handleReturnTransactionItem, "handleReturnTransactionItem");
 async function handleUnsplitTransaction(request, env) {
   const transactionId = idFromPath(request, 2);
   await env.DB.prepare("DELETE FROM transaction_splits WHERE transaction_id = ?").bind(transactionId).run();
