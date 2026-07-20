@@ -582,8 +582,14 @@ async function syncPlaidNow() {
   }, step.at));
   try {
     const data = await apiFetch('/api/plaid/sync-now', { method: 'POST' });
-    showHeaderStatus(data.added > 0 ? `✓ Added ${data.added} new transaction(s)` : '✓ Nothing new since last check');
-    await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates()]);
+    if (data.errors && data.errors.length > 0) {
+      const names = data.errors.map((e) => e.institution_name || e.item_id).join(', ');
+      showHeaderStatus(`✗ Sync failed for ${names} — reconnect in Settings`, 8000);
+      showErrorToast(`Plaid connection broken for ${names}. Go to Settings to reconnect.`);
+    } else {
+      showHeaderStatus(data.added > 0 ? `✓ Added ${data.added} new transaction(s)` : '✓ Nothing new since last check');
+    }
+    await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates(), loadLinkedAccounts()]);
     if (activeView === 'transactions') await loadTransactions();
   } catch (err) {
     showHeaderStatus(`✗ Sync failed: ${err.message}`, 5000);
@@ -907,12 +913,23 @@ async function loadLinkedAccounts() {
       listEl.innerHTML = '<div class="linked-accounts-empty">No banks connected yet</div>';
       return;
     }
-    listEl.innerHTML = data.items.map((item) => `
-      <div class="linked-account-row">
-        <span class="linked-account-name">${item.institution_name || 'Unknown institution'}</span>
-        <span class="linked-account-since">Connected ${formatDate(item.created_at)}</span>
+    listEl.innerHTML = data.items.map((item) => {
+      const broken = item.status && item.status !== 'ok';
+      return `
+      <div class="linked-account-row${broken ? ' linked-account-row-broken' : ''}">
+        <div class="linked-account-info">
+          <span class="linked-account-name">${item.institution_name || 'Unknown institution'}</span>
+          <span class="linked-account-since">${broken
+            ? `⚠️ Connection broken${item.error_code ? ` (${item.error_code})` : ''}`
+            : `Connected ${formatDate(item.created_at)}`}</span>
+        </div>
+        ${broken ? `<button class="btn-reconnect-bank" data-item-id="${item.id}">Reconnect</button>` : ''}
       </div>
-    `).join('');
+    `;
+    }).join('');
+    listEl.querySelectorAll('.btn-reconnect-bank').forEach((btn) => {
+      btn.addEventListener('click', () => reconnectBank(btn.dataset.itemId, btn));
+    });
   } catch (err) {
     console.error('Loading linked accounts failed:', err);
     listEl.innerHTML = '<div class="linked-accounts-empty">Couldn\'t load linked accounts</div>';
@@ -925,6 +942,7 @@ async function loadLinkedAccounts() {
 // to resume where it left off, so we stash the token across that reload.
 function createPlaidLinkHandler(token, btn) {
   const isOAuthResume = window.location.href.includes('oauth_state_id=');
+  const originalLabel = btn ? btn.textContent : null;
   return Plaid.create({
     token,
     receivedRedirectUri: isOAuthResume ? window.location.href : void 0,
@@ -946,7 +964,7 @@ function createPlaidLinkHandler(token, btn) {
       } finally {
         if (btn) {
           btn.disabled = false;
-          btn.textContent = '+ Connect a bank';
+          btn.textContent = originalLabel;
         }
       }
     },
@@ -954,7 +972,7 @@ function createPlaidLinkHandler(token, btn) {
       sessionStorage.removeItem('plaid_link_token');
       if (btn) {
         btn.disabled = false;
-        btn.textContent = '+ Connect a bank';
+        btn.textContent = originalLabel;
       }
       if (err) console.error('Plaid Link exited with error:', err);
     }
@@ -974,6 +992,30 @@ async function connectBank() {
     btn.disabled = false;
     btn.textContent = '+ Connect a bank';
     showErrorToast(`Could not start bank connection: ${err.message}`);
+  }
+}
+
+// Update-mode reconnect: reuses the broken Item instead of linking a new
+// one, by asking the server for a link_token scoped to that item's
+// access_token (see handlePlaidCreateLinkToken). Button state is handed off
+// to createPlaidLinkHandler's onSuccess/onExit once Link opens, same as
+// connectBank() does.
+async function reconnectBank(itemDbId, btn) {
+  if (!itemDbId || typeof Plaid === 'undefined') return;
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const { link_token } = await apiFetch('/api/plaid/link-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ item_id: itemDbId })
+    });
+    sessionStorage.setItem('plaid_link_token', link_token);
+    createPlaidLinkHandler(link_token, btn).open();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = 'Reconnect';
+    showErrorToast(`Could not start reconnect: ${err.message}`);
   }
 }
 

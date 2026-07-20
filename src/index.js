@@ -1055,11 +1055,19 @@ async function plaidFetch(env, path, body) {
   const data = await res.json();
   if (!res.ok) {
     console.error(`Plaid ${path} failed (${res.status}):`, data);
-    throw new Error(data.error_message || `Plaid request to ${path} failed`);
+    const err = new Error(data.error_message || `Plaid request to ${path} failed`);
+    err.plaidErrorCode = data.error_code || "UNKNOWN_ERROR";
+    throw err;
   }
   return data;
 }
 __name(plaidFetch, "plaidFetch");
+async function markPlaidItemStatus(env, itemId, status, errorCode) {
+  await env.DB.prepare(
+    "UPDATE plaid_items SET status = ?, error_code = ?, updated_at = datetime('now') WHERE item_id = ?"
+  ).bind(status, errorCode, itemId).run();
+}
+__name(markPlaidItemStatus, "markPlaidItemStatus");
 function base64UrlToBytes(b64url2) {
   const padded = b64url2.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(b64url2.length / 4) * 4, "=");
   const binary = atob(padded);
@@ -1178,6 +1186,21 @@ async function findLikelyDuplicate(env, { merchant, amount, occurredAt }) {
 }
 __name(findLikelyDuplicate, "findLikelyDuplicate");
 var PLAID_MIN_SYNC_DATE = "2026-07-01";
+// Per-item allow-list of account masks whose transactions actually get
+// synced — lets an Item stay linked to accounts Plaid forces into scope
+// (e.g. Gesa's account-select screen has no partial-selection support) while
+// this app still ignores the ones nobody wants budgeted, like savings. NULL
+// (the default) means "no filter, sync every account on this Item" — that's
+// what every Item had before this existed, so it stays the behavior unless a
+// row is explicitly configured. The SMS ingestion pipeline is separate and
+// unaffected — it mirrors every transaction on the card regardless of this.
+async function getSyncedAccountIds(env, itemRow) {
+  if (!itemRow.synced_account_masks) return null;
+  const masks = new Set(itemRow.synced_account_masks.split(",").map((m) => m.trim()).filter(Boolean));
+  const data = await plaidFetch(env, "/accounts/get", { access_token: itemRow.access_token });
+  return new Set(data.accounts.filter((a) => masks.has(a.mask)).map((a) => a.account_id));
+}
+__name(getSyncedAccountIds, "getSyncedAccountIds");
 var DUPLICATE_CHECK_EXCLUDED_KEYWORDS = ["google", "grok", "xai", "anthropic", "claude"];
 function isDuplicateCheckExcluded(merchant) {
   const haystack = (merchant || "").toLowerCase();
@@ -1201,14 +1224,17 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
     cursor = page.next_cursor;
     hasMore = page.has_more;
   }
-  for (const tx of modified) {
+  const syncedAccountIds = await getSyncedAccountIds(env, itemRow);
+  const syncedModified = syncedAccountIds ? modified.filter((tx) => syncedAccountIds.has(tx.account_id)) : modified;
+  const syncedAdded = syncedAccountIds ? added.filter((tx) => syncedAccountIds.has(tx.account_id)) : added;
+  for (const tx of syncedModified) {
     const merchant = tx.merchant_name || tx.name;
     const occurredAt = tx.datetime || tx.authorized_datetime || tx.date;
     await env.DB.prepare(
       "UPDATE transactions SET amount = ?, merchant = ?, occurred_at = ?, plaid_pending = ? WHERE plaid_transaction_id = ?"
     ).bind(Math.abs(tx.amount), merchant, occurredAt, tx.pending ? 1 : 0, tx.transaction_id).run();
   }
-  for (const tx of added) {
+  for (const tx of syncedAdded) {
     if (tx.date < PLAID_MIN_SYNC_DATE) continue;
     const merchant = tx.merchant_name || tx.name;
     const amount = tx.amount;
@@ -1297,7 +1323,7 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
   await env.DB.prepare(
     "UPDATE plaid_items SET cursor = ?, updated_at = datetime('now') WHERE id = ?"
   ).bind(cursor, itemRow.id).run();
-  return { added: added.length, modified: modified.length, removed: removed.length };
+  return { added: syncedAdded.length, modified: syncedModified.length, removed: removed.length };
 }
 __name(syncPlaidTransactions, "syncPlaidTransactions");
 async function handlePlaidWebhook(request, env, ctx) {
@@ -1319,6 +1345,7 @@ async function handlePlaidWebhook(request, env, ctx) {
     const institutionName = itemRow2?.institution_name || "Unknown institution";
     const errorCode = payload.error?.error_code || "UNKNOWN_ERROR";
     console.error(`Plaid item error for ${institutionName} (${payload.item_id}): ${errorCode}`);
+    ctx.waitUntil(markPlaidItemStatus(env, payload.item_id, "error", errorCode));
     ctx.waitUntil(sendPushNotification(env, {
       title: `Bank connection needs attention: ${institutionName}`,
       body: errorCode === "ITEM_LOGIN_REQUIRED"
@@ -1384,17 +1411,30 @@ async function handlePlaidSyncNow(env, ctx) {
       await sleep(5000);
       const counts = await syncPlaidTransactions(env, ctx, itemRow);
       added += counts.added;
+      await markPlaidItemStatus(env, itemRow.item_id, "ok", null);
     } catch (err) {
       console.error(`UI-triggered Plaid sync failed for item ${itemRow.item_id}:`, err);
-      errors.push({ item_id: itemRow.item_id, error: err.message });
+      await markPlaidItemStatus(env, itemRow.item_id, "error", err.plaidErrorCode || "UNKNOWN_ERROR");
+      errors.push({
+        item_id: itemRow.item_id,
+        institution_name: itemRow.institution_name,
+        error: err.message,
+        errorCode: err.plaidErrorCode || "UNKNOWN_ERROR"
+      });
     }
   }
+  let balanceErrors = [];
   try {
-    await refreshPlaidBalanceCache(env);
+    const balanceResult = await refreshPlaidBalanceCache(env);
+    balanceErrors = balanceResult.errors;
   } catch (err) {
     console.error("UI-triggered balance refresh failed:", err);
   }
-  return jsonResponse({ success: errors.length === 0, added, errors });
+  return jsonResponse({
+    success: errors.length === 0 && balanceErrors.length === 0,
+    added,
+    errors: [...errors, ...balanceErrors]
+  });
 }
 __name(handlePlaidSyncNow, "handlePlaidSyncNow");
 var BALANCE_ACCOUNT_MASKS = { checking: "2250", savings: "3735" };
@@ -1403,6 +1443,7 @@ async function refreshPlaidBalanceCache(env) {
   const existing = await env.DB.prepare("SELECT checking, savings FROM balance_cache WHERE id = 1").first();
   let checking = existing?.checking ?? null;
   let savings = existing?.savings ?? null;
+  const errors = [];
   for (const itemRow of results) {
     try {
       const data = await plaidFetch(env, "/accounts/balance/get", { access_token: itemRow.access_token });
@@ -1413,15 +1454,23 @@ async function refreshPlaidBalanceCache(env) {
           savings = account.balances.current;
         }
       }
+      await markPlaidItemStatus(env, itemRow.item_id, "ok", null);
     } catch (err) {
       console.error(`Balance fetch failed for item ${itemRow.item_id}:`, err);
+      await markPlaidItemStatus(env, itemRow.item_id, "error", err.plaidErrorCode || "UNKNOWN_ERROR");
+      errors.push({
+        item_id: itemRow.item_id,
+        institution_name: itemRow.institution_name,
+        error: err.message,
+        errorCode: err.plaidErrorCode || "UNKNOWN_ERROR"
+      });
     }
   }
   await env.DB.prepare(
     `INSERT INTO balance_cache (id, checking, savings, updated_at) VALUES (1, ?, ?, datetime('now'))
     ON CONFLICT(id) DO UPDATE SET checking = excluded.checking, savings = excluded.savings, updated_at = excluded.updated_at`
   ).bind(checking, savings).run();
-  return { checking, savings };
+  return { checking, savings, errors };
 }
 __name(refreshPlaidBalanceCache, "refreshPlaidBalanceCache");
 async function handlePlaidBalance(env) {
@@ -1438,22 +1487,42 @@ async function handleRefreshPlaidBalance(request, env) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
   const result = await refreshPlaidBalanceCache(env);
-  return jsonResponse({ success: true, ...result });
+  return jsonResponse({ success: result.errors.length === 0, ...result });
 }
 __name(handleRefreshPlaidBalance, "handleRefreshPlaidBalance");
 async function handlePlaidCreateLinkToken(request, env) {
   const origin = new URL(request.url).origin;
-  const data = await plaidFetch(env, "/link/token/create", {
+  let reconnectItemId = null;
+  try {
+    const body = await request.json();
+    reconnectItemId = body?.item_id ?? null;
+  } catch {
+  }
+  const payload = {
     user: { client_user_id: "budget-tracker-primary-user" },
     client_name: "Budget Tracker",
-    products: ["transactions"],
     country_codes: ["US"],
     language: "en",
     // Required for OAuth institutions (e.g. Discover, Chase) to complete the
     // bank-hosted login step and hand control back to Link. Must also be
     // added to the Plaid Dashboard's Allowed Redirect URIs.
     redirect_uri: `${origin}/`
-  });
+  };
+  if (reconnectItemId) {
+    // Update mode: passing the existing item's access_token instead of
+    // `products` tells Link to repair that same Item (e.g. after
+    // ITEM_LOGIN_REQUIRED) rather than create a new one.
+    const itemRow = await env.DB.prepare(
+      "SELECT access_token FROM plaid_items WHERE id = ?"
+    ).bind(reconnectItemId).first();
+    if (!itemRow) {
+      return jsonResponse({ error: "Unknown linked account" }, 404);
+    }
+    payload.access_token = itemRow.access_token;
+  } else {
+    payload.products = ["transactions"];
+  }
+  const data = await plaidFetch(env, "/link/token/create", payload);
   return jsonResponse({ link_token: data.link_token });
 }
 __name(handlePlaidCreateLinkToken, "handlePlaidCreateLinkToken");
@@ -1467,12 +1536,15 @@ async function handlePlaidExchangeToken(request, env) {
   await env.DB.prepare(
     "INSERT OR IGNORE INTO plaid_items (item_id, access_token, institution_name) VALUES (?, ?, ?)"
   ).bind(data.item_id, data.access_token, institution_name || null).run();
+  // Covers both a brand-new item and update-mode re-links (which return the
+  // same item_id) — either way, the connection is healthy again now.
+  await markPlaidItemStatus(env, data.item_id, "ok", null);
   return jsonResponse({ success: true });
 }
 __name(handlePlaidExchangeToken, "handlePlaidExchangeToken");
 async function handlePlaidListItems(env) {
   const { results } = await env.DB.prepare(
-    "SELECT id, institution_name, created_at, updated_at FROM plaid_items ORDER BY created_at ASC"
+    "SELECT id, institution_name, status, error_code, created_at, updated_at FROM plaid_items ORDER BY created_at ASC"
   ).all();
   return jsonResponse({ items: results });
 }
