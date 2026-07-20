@@ -1290,6 +1290,12 @@ html, body {
   flex-direction: column;
   gap: 4px;
   flex: 1;
+  /* Without this, a flex item's default min-width is auto (i.e. the width
+     of its widest unbreakable content) — a split transaction with several
+     category chips would force this column wider than available space,
+     pushing the amount/delete button off the right edge of the screen
+     instead of the chips wrapping onto their own lines. */
+  min-width: 0;
 }
 
 .transaction-merchant {
@@ -1306,8 +1312,19 @@ html, body {
 .transaction-category {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  column-gap: 10px;
   margin-left: 12px;
+}
+
+/* Groups a split's icon+name+amount so wrapping (see .transaction-category)
+   only ever breaks between whole categories, never between an icon and its
+   own label. */
+.category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .transaction-amount {
@@ -1315,6 +1332,7 @@ html, body {
   font-weight: 600;
   color: var(--text);
   min-width: 80px;
+  flex-shrink: 0;
   text-align: right;
 }
 

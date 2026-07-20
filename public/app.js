@@ -2220,11 +2220,15 @@ function renderTransactions(transactions) {
       `;
       item.querySelector('.transaction-info').appendChild(categoryInfo);
     } else if (txn.is_split && Array.isArray(txn.splits)) {
+      // Each split gets its own chip (rather than one flat inline-nowrap row)
+      // so 3+ categories wrap onto additional lines instead of overflowing
+      // the transaction row off the edge of the screen — see transaction-category's
+      // flex-wrap in style.css.
       const categoryInfo = document.createElement('div');
       categoryInfo.className = 'transaction-category';
       categoryInfo.innerHTML = txn.splits.map((s) =>
-        `<span class="category-icon" style="color: ${s.color}">${s.icon}</span><span class="category-name">${s.name} (${fmt(s.amount)})</span>`
-      ).join('&nbsp;&nbsp;');
+        `<span class="category-chip"><span class="category-icon" style="color: ${s.color}">${s.icon}</span><span class="category-name">${s.name} (${fmt(s.amount)})</span></span>`
+      ).join('');
       item.querySelector('.transaction-info').appendChild(categoryInfo);
     }
 
