@@ -1189,21 +1189,36 @@ async function findLikelyDuplicate(env, { merchant, amount, occurredAt }) {
 }
 __name(findLikelyDuplicate, "findLikelyDuplicate");
 var PLAID_MIN_SYNC_DATE = "2026-07-01";
+function parseMaskList(csv) {
+  return new Set((csv || "").split(",").map((m) => m.trim()).filter(Boolean));
+}
+__name(parseMaskList, "parseMaskList");
 // Per-item allow-list of account masks whose transactions actually get
 // synced — lets an Item stay linked to accounts Plaid forces into scope
 // (e.g. Gesa's account-select screen has no partial-selection support) while
 // this app still ignores the ones nobody wants budgeted, like savings. NULL
 // (the default) means "no filter, sync every account on this Item" — that's
 // what every Item had before this existed, so it stays the behavior unless a
-// row is explicitly configured. The SMS ingestion pipeline is separate and
-// unaffected — it mirrors every transaction on the card regardless of this.
-async function getSyncedAccountIds(env, itemRow) {
-  if (!itemRow.synced_account_masks) return null;
-  const masks = new Set(itemRow.synced_account_masks.split(",").map((m) => m.trim()).filter(Boolean));
+// row is explicitly configured.
+//
+// sms_primary_masks marks accounts (e.g. the Wise credit card) that are
+// dual-sourced: SMS alerts arrive first and are treated as the source of
+// truth, so Plaid only inserts a transaction from these accounts when no
+// matching SMS-sourced transaction already exists — Plaid is purely a
+// fallback for a missed/delayed SMS, not a second copy of every charge.
+async function getAccountMaskInfo(env, itemRow) {
+  if (!itemRow.synced_account_masks && !itemRow.sms_primary_masks) {
+    return { syncedAccountIds: null, smsPrimaryAccountIds: /* @__PURE__ */ new Set() };
+  }
   const data = await plaidFetch(env, "/accounts/get", { access_token: itemRow.access_token });
-  return new Set(data.accounts.filter((a) => masks.has(a.mask)).map((a) => a.account_id));
+  const syncedMasks = itemRow.synced_account_masks ? parseMaskList(itemRow.synced_account_masks) : null;
+  const smsPrimaryMasks = parseMaskList(itemRow.sms_primary_masks);
+  return {
+    syncedAccountIds: syncedMasks ? new Set(data.accounts.filter((a) => syncedMasks.has(a.mask)).map((a) => a.account_id)) : null,
+    smsPrimaryAccountIds: new Set(data.accounts.filter((a) => smsPrimaryMasks.has(a.mask)).map((a) => a.account_id))
+  };
 }
-__name(getSyncedAccountIds, "getSyncedAccountIds");
+__name(getAccountMaskInfo, "getAccountMaskInfo");
 var DUPLICATE_CHECK_EXCLUDED_KEYWORDS = ["google", "grok", "xai", "anthropic", "claude"];
 function isDuplicateCheckExcluded(merchant) {
   const haystack = (merchant || "").toLowerCase();
@@ -1227,7 +1242,7 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
     cursor = page.next_cursor;
     hasMore = page.has_more;
   }
-  const syncedAccountIds = await getSyncedAccountIds(env, itemRow);
+  const { syncedAccountIds, smsPrimaryAccountIds } = await getAccountMaskInfo(env, itemRow);
   const syncedModified = syncedAccountIds ? modified.filter((tx) => syncedAccountIds.has(tx.account_id)) : modified;
   const syncedAdded = syncedAccountIds ? added.filter((tx) => syncedAccountIds.has(tx.account_id)) : added;
   for (const tx of syncedModified) {
@@ -1264,6 +1279,13 @@ async function syncPlaidTransactions(env, ctx, itemRow) {
     }
 
     const duplicate = isDuplicateCheckExcluded(merchant) ? null : await findLikelyDuplicate(env, { merchant, amount: Math.abs(amount), occurredAt });
+    if (duplicate && smsPrimaryAccountIds.has(tx.account_id)) {
+      // SMS already captured this charge (SMS is the source of truth for
+      // this account) — Plaid's copy is redundant, not a fallback, so skip
+      // it entirely instead of inserting a second row to flag/clean up.
+      console.log(`Skipping Plaid transaction ${tx.transaction_id} — already captured via SMS as transaction ${duplicate.id}`);
+      continue;
+    }
     const { categoryId: suggestedCategoryId, method: suggestionMethod, detail: suggestionDetail } = await suggestCategoryId(env, merchant, merchant);
     const status = suggestedCategoryId ? "categorized" : "pending";
     const now = (/* @__PURE__ */ new Date()).toISOString();
