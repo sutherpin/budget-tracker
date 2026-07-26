@@ -5,7 +5,7 @@
 --
 -- status values: 'matched' | 'needs_review' | 'no_transaction_match' |
 --                 'sum_mismatch' | 'parse_error' | 'no_attachment' | 'not_a_receipt' |
---                 'already_complete' | 'duplicate_receipt'
+--                 'already_complete' | 'duplicate_receipt' | 'dismissed'
 --
 -- Apply with:
 --   npx wrangler d1 execute budget-tracker-db --local --file=migrations/0009_add_receipt_processing.sql

@@ -789,6 +789,9 @@ var index_default = {
       if (/^\/api\/receipts\/\d+\/match$/.test(url.pathname) && request.method === "POST") {
         return await handleMatchReceiptToTransaction(request, env, ctx, url.pathname.split("/")[3]);
       }
+      if (/^\/api\/receipts\/\d+$/.test(url.pathname) && request.method === "DELETE") {
+        return await handleDeleteReceipt(env, url.pathname.split("/")[3]);
+      }
       if (url.pathname === "/api/returns/candidates" && request.method === "GET") {
         return await handleGetReturnCandidates(env, url.searchParams.get("merchant"), parseFloat(url.searchParams.get("amount")));
       }
@@ -2220,7 +2223,7 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
       const priorReceipt = await env.DB.prepare(
         `SELECT id, matched_transaction_id FROM processed_receipt_emails
         WHERE source = ? AND receipt_total = ? AND receipt_date = ?
-          AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete')
+          AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete', 'dismissed')
         LIMIT 1`
       ).bind(effectiveSource, parsed.total, parsed.date).first();
       if (priorReceipt) {
@@ -2433,6 +2436,22 @@ async function handleMatchReceiptToTransaction(request, env, ctx, receiptId) {
   return jsonResponse({ success: true, ...result });
 }
 __name(handleMatchReceiptToTransaction, "handleMatchReceiptToTransaction");
+async function handleDeleteReceipt(env, receiptId) {
+  const receipt = await env.DB.prepare(
+    "SELECT id, status FROM processed_receipt_emails WHERE id = ?"
+  ).bind(receiptId).first();
+  if (!receipt) return jsonResponse({ error: "Receipt not found" }, 404);
+  if (receipt.status === "matched") {
+    return jsonResponse({ error: "This receipt already categorized a transaction — remove it from that transaction instead of deleting it here" }, 400);
+  }
+  // Soft-delete (status = 'dismissed') rather than a hard DELETE: the row's
+  // gmail_message_id is what keeps the Gmail-check cron from re-fetching and
+  // re-parsing this same email as "new" on the next run — actually removing
+  // the row would just resurrect it a half hour later.
+  await env.DB.prepare("UPDATE processed_receipt_emails SET status = 'dismissed' WHERE id = ?").bind(receiptId).run();
+  return jsonResponse({ success: true });
+}
+__name(handleDeleteReceipt, "handleDeleteReceipt");
 var RETURN_MATCH_WINDOW_DAYS = 60;
 var RETURN_MATCH_TOLERANCE = 0.02;
 async function findReturnCandidates(env, source, sinceDate) {

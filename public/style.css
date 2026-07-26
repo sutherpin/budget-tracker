@@ -608,6 +608,20 @@ html, body {
 .unclaimed-receipt-text {
   font-size: 13px;
   color: var(--text-dim);
+  flex: 1;
+}
+.unclaimed-receipt-delete {
+  background: none;
+  border: none;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px;
+  cursor: pointer;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+.unclaimed-receipt-delete:hover {
+  opacity: 1;
 }
 .unclaimed-receipt-row-clickable {
   cursor: pointer;

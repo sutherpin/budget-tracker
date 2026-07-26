@@ -661,8 +661,13 @@ function renderUnclaimedReceipts(receipts) {
     row.innerHTML = `
       <span class="unclaimed-receipt-icon">${icon}</span>
       <span class="unclaimed-receipt-text">${message}</span>
+      <button type="button" class="unclaimed-receipt-delete" title="Delete this receipt — it won't be counted toward the budget">🗑️</button>
     `;
     row.addEventListener('click', () => openMatchReceiptModal(r));
+    row.querySelector('.unclaimed-receipt-delete').addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteReceipt(r);
+    });
     listEl.appendChild(row);
     const itemsText = receiptItemsNoteText(r);
     if (itemsText) {
@@ -733,6 +738,18 @@ async function matchReceiptToTransaction(receiptId, transactionId) {
   } catch (err) {
     console.error('Match receipt failed:', err);
     alert(`Failed to attach receipt: ${err.message}`);
+  }
+}
+
+async function deleteReceipt(receipt) {
+  const merchantLabel = receiptMerchantLabel(receipt.source);
+  if (!confirm(`Delete this ${merchantLabel} receipt for ${fmt(receipt.receipt_total)}? It won't be counted toward the budget.`)) return;
+  try {
+    await apiFetch(`/api/receipts/${receipt.id}`, { method: 'DELETE' });
+    await loadReceiptStatus();
+  } catch (err) {
+    console.error('Delete receipt failed:', err);
+    alert(`Failed to delete receipt: ${err.message}`);
   }
 }
 
