@@ -777,6 +777,15 @@ var index_default = {
       if (url.pathname === "/api/receipts/check-now" && request.method === "POST") {
         return await handleReceiptCheckNow(request, env, ctx);
       }
+      if (url.pathname === "/api/receipts/screenshot" && request.method === "POST") {
+        return await handleReceiptScreenshotUpload(request, env, ctx);
+      }
+      if (url.pathname === "/api/settings" && request.method === "GET") {
+        return await handleGetSettings(env);
+      }
+      if (url.pathname === "/api/settings" && request.method === "POST") {
+        return await handleUpdateSettings(request, env);
+      }
       if (url.pathname === "/api/receipts/sync-now" && request.method === "POST") {
         return await handleReceiptSyncNow(env, ctx);
       }
@@ -1084,6 +1093,11 @@ async function sha256Hex(text) {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 __name(sha256Hex, "sha256Hex");
+async function sha256HexBytes(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(sha256HexBytes, "sha256HexBytes");
 async function verifyPlaidWebhook(env, request, rawBody) {
   try {
     const jwt = request.headers.get("Plaid-Verification");
@@ -1825,6 +1839,58 @@ Respond with structured JSON only, matching the given schema.`;
   return callClaudeForReceipt(env, [contentBlock, { type: "text", text: prompt }], "receipt");
 }
 __name(parseAndCategorizeReceipt, "parseAndCategorizeReceipt");
+// Retailer order-confirmation emails increasingly ship stripped-down "order
+// tracker" layouts with no product title at all (see the format notes in
+// parseAndCategorizeAmazonEmail below) — the only remaining place with a real
+// per-item description and price is the order/order-summary page on the
+// retailer's own site, which requires a logged-in session no worker can
+// reach. Instead, the user screenshots that page manually and drops it in a
+// watched folder; this parses that screenshot the same way
+// parseAndCategorizeReceipt parses an in-store receipt photo, except the
+// vendor isn't known in advance — Claude has to identify it from the page.
+async function parseAndCategorizeReceiptScreenshot(env, imageBytes, mimeType) {
+  const categoryNames = await fetchActiveCategoryNames(env);
+  const contentBlock = { type: "image", source: { type: "base64", media_type: mimeType, data: bytesToStandardBase64(imageBytes) } };
+  const prompt = `This image is a screenshot of an online order-summary / order-details page from some
+retailer's website (e.g. Amazon, eBay, Walmart, Target, Costco, or another online store), showing
+a list of purchased item(s) with their individual prices, plus an order summary box with
+something like Item(s) Subtotal, Shipping & Handling, Tax, and Grand/Order Total. It may also show
+shipping address and payment method details near the top — ignore those, they aren't needed.
+
+First decide: does this screenshot actually show an order summary with item(s) and a total? If
+not (e.g. it's some other page entirely), set isReceipt to false and leave the other fields as
+empty/zero placeholders.
+
+Identify which retailer this is from its branding, logo, or page text, and set "merchant"
+accordingly using one of: "walmart", "target", "costco", "amazon", "ebay", or "unknown" if you
+can't confidently tell which of those it is (still extract the items either way — don't reject a
+real order summary just because you can't name the specific retailer).
+
+Extract every purchased line item shown, using its own listed price as "amount" — do not split
+the grand total evenly, since each item's real price is printed next to it. Use the printed
+subtotal line as "subtotal" and the tax line as "taxTotal"; use the grand/order total line as
+"total". If shipping & handling is a nonzero charge, add it to whichever single item's amount
+makes the items sum to the subtotal, or as its own "Shipping" item categorized as "Misc" if it
+doesn't cleanly attribute to one item.
+
+Convert the order date to strict ISO 8601 (YYYY-MM-DD), regardless of the format printed on the
+page.
+
+Categorize each item into one of these existing budget categories when a reasonable match
+exists: ${categoryNames.join(", ")}.
+If no existing category fits well, choose a short, sensible new category name instead of
+forcing a bad match.
+
+Since this screenshot shows the real product title for every item (not a vague category
+summary), you should rarely need "uncertain: true" here — set it only when a title is genuinely
+ambiguous about what it actually is. Listing titles on a page like this are already full product
+names, so leave "friendlyName" as an empty string for every item — there's nothing cryptic here
+to translate.
+
+Respond with structured JSON only, matching the given schema.`;
+  return callClaudeForReceipt(env, [contentBlock, { type: "text", text: prompt }], "receipt screenshot");
+}
+__name(parseAndCategorizeReceiptScreenshot, "parseAndCategorizeReceiptScreenshot");
 // Amazon and eBay order-confirmation emails share the same skeleton (decide
 // isReceipt, extract items, categorize, convert the date, respond with the
 // schema) — only the merchant name and its email-format quirks differ, so
@@ -2184,6 +2250,113 @@ async function notifyGmailAuthFailureIfNeeded(env, ctx) {
   ctx.waitUntil(notifyMacroDroid(env, "⚠️ Gmail receipt connection broken — refresh token needs renewal."));
 }
 __name(notifyGmailAuthFailureIfNeeded, "notifyGmailAuthFailureIfNeeded");
+// Takes an already-parsed receipt (from an email attachment/body OR a
+// manually uploaded screenshot) through dedup, transaction matching, and
+// categorization. `messageId` is whatever unique key the caller dedups on —
+// a real Gmail message id for the email pipelines, or a content-hash-derived
+// synthetic id for manual uploads.
+async function finalizeParsedReceipt(env, ctx, messageId, source, parsed) {
+  if (!parsed.isReceipt) {
+    await recordProcessedReceiptEmail(env, { messageId, source, status: "not_a_receipt" });
+    return { messageId, status: "not_a_receipt" };
+  }
+  const itemSum = parsed.items.reduce((s, i) => s + i.amount, 0);
+  if (Math.abs(itemSum - parsed.subtotal) > 0.01) {
+    await recordProcessedReceiptEmail(env, {
+      messageId,
+      source,
+      status: "parse_error",
+      receiptTotal: parsed.total,
+      receiptDate: parsed.date,
+      parsedJson: parsed,
+      detail: `Item sum ${itemSum.toFixed(2)} didn't match subtotal ${parsed.subtotal.toFixed(2)}`
+    });
+    return { messageId, status: "parse_error" };
+  }
+  // A single Gmail query (has:attachment) catches every in-store
+  // receipt regardless of merchant, so the actual merchant is only known
+  // once Claude has looked at the image — use that instead of the job's
+  // nominal source whenever it's a recognized one.
+  const effectiveSource = parsed.merchant && parsed.merchant !== "unknown" && RECEIPT_SOURCES[parsed.merchant]
+    ? parsed.merchant
+    : source;
+  // Same receipt forwarded/scanned/screenshotted twice arrives under a
+  // different unique id, so the messageId dedup above never catches it.
+  // Catch it here by content instead — same merchant/total/date already
+  // recorded — before it gets anywhere near transaction matching, so a
+  // re-scan can never masquerade as a second real purchase or a "conflict"
+  // needing the user's attention.
+  const priorReceipt = await env.DB.prepare(
+    `SELECT id, matched_transaction_id FROM processed_receipt_emails
+    WHERE source = ? AND receipt_total = ? AND receipt_date = ?
+      AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete', 'dismissed')
+    LIMIT 1`
+  ).bind(effectiveSource, parsed.total, parsed.date).first();
+  if (priorReceipt) {
+    await recordProcessedReceiptEmail(env, {
+      messageId,
+      source: effectiveSource,
+      status: "duplicate_receipt",
+      receiptTotal: parsed.total,
+      receiptDate: parsed.date,
+      parsedJson: parsed,
+      matchedTransactionId: priorReceipt.matched_transaction_id ?? null,
+      detail: `Duplicate of receipt #${priorReceipt.id} (same ${effectiveSource} total/date) — ignored`
+    });
+    return { messageId, status: "duplicate_receipt" };
+  }
+  const txn = await findMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
+  if (!txn) {
+    // No still-pending transaction to attach to. Distinguish "one exists
+    // but was already resolved by something else in the meantime" (a
+    // vendor/amount/date match was found, but that transaction is
+    // already categorized — keep parsed_json so the user can review the
+    // freshly-scanned items and decide whether to override it) from
+    // "nothing has arrived yet" (keep parsed_json around so a later
+    // Plaid sync can claim it).
+    const alreadyResolved = await findAnyMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
+    if (alreadyResolved) {
+      await recordProcessedReceiptEmail(env, {
+        messageId,
+        source: effectiveSource,
+        status: "already_complete",
+        receiptTotal: parsed.total,
+        receiptDate: parsed.date,
+        parsedJson: parsed,
+        matchedTransactionId: alreadyResolved.id,
+        detail: "Matching transaction was already categorized before this receipt was processed — flagged for review."
+      });
+      return { messageId, status: "already_complete", transactionId: alreadyResolved.id };
+    }
+    await recordProcessedReceiptEmail(env, {
+      messageId,
+      source: effectiveSource,
+      status: "no_transaction_match",
+      receiptTotal: parsed.total,
+      receiptDate: parsed.date,
+      parsedJson: parsed
+    });
+    return { messageId, status: "no_transaction_match" };
+  }
+  const result = await applyReceiptResult(env, txn.id, parsed, txn.amount, { merchant: txn.merchant, source: effectiveSource });
+  await recordProcessedReceiptEmail(env, {
+    messageId,
+    source: effectiveSource,
+    status: result.outcome,
+    receiptTotal: parsed.total,
+    receiptDate: parsed.date,
+    parsedJson: parsed,
+    matchedTransactionId: txn.id,
+    detail: result.summary
+  });
+  ctx.waitUntil(sendPushNotification(env, {
+    title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || source}` : `Auto-categorized: ${txn.merchant || source}`,
+    body: result.outcome === "needs_review" ? `$${txn.amount.toFixed(2)} — tap to categorize manually` : `$${txn.amount.toFixed(2)} — ${result.summary}`,
+    transactionId: txn.id
+  }));
+  return { messageId, status: result.outcome, transactionId: txn.id };
+}
+__name(finalizeParsedReceipt, "finalizeParsedReceipt");
 async function processReceiptEmails(env, ctx, source, { listCandidateIds, extractAndParse }) {
   let accessToken;
   try {
@@ -2209,111 +2382,7 @@ async function processReceiptEmails(env, ctx, source, { listCandidateIds, extrac
         summary.push({ messageId, status: extraction.status });
         continue;
       }
-      const parsed = extraction.parsed;
-      if (!parsed.isReceipt) {
-        await recordProcessedReceiptEmail(env, { messageId, source, status: "not_a_receipt" });
-        summary.push({ messageId, status: "not_a_receipt" });
-        continue;
-      }
-      const itemSum = parsed.items.reduce((s, i) => s + i.amount, 0);
-      if (Math.abs(itemSum - parsed.subtotal) > 0.01) {
-        await recordProcessedReceiptEmail(env, {
-          messageId,
-          source,
-          status: "parse_error",
-          receiptTotal: parsed.total,
-          receiptDate: parsed.date,
-          parsedJson: parsed,
-          detail: `Item sum ${itemSum.toFixed(2)} didn't match subtotal ${parsed.subtotal.toFixed(2)}`
-        });
-        summary.push({ messageId, status: "parse_error" });
-        continue;
-      }
-      // A single Gmail query (has:attachment) catches every in-store
-      // receipt regardless of merchant, so the actual merchant is only known
-      // once Claude has looked at the image — use that instead of the job's
-      // nominal source whenever it's a recognized one.
-      const effectiveSource = parsed.merchant && parsed.merchant !== "unknown" && RECEIPT_SOURCES[parsed.merchant]
-        ? parsed.merchant
-        : source;
-      // Same receipt forwarded/scanned twice arrives as two distinct Gmail
-      // messages, so the gmail_message_id dedup above never catches it. Catch
-      // it here by content instead — same merchant/total/date already
-      // recorded — before it gets anywhere near transaction matching, so a
-      // re-scan can never masquerade as a second real purchase or a "conflict"
-      // needing the user's attention.
-      const priorReceipt = await env.DB.prepare(
-        `SELECT id, matched_transaction_id FROM processed_receipt_emails
-        WHERE source = ? AND receipt_total = ? AND receipt_date = ?
-          AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete', 'dismissed')
-        LIMIT 1`
-      ).bind(effectiveSource, parsed.total, parsed.date).first();
-      if (priorReceipt) {
-        await recordProcessedReceiptEmail(env, {
-          messageId,
-          source: effectiveSource,
-          status: "duplicate_receipt",
-          receiptTotal: parsed.total,
-          receiptDate: parsed.date,
-          parsedJson: parsed,
-          matchedTransactionId: priorReceipt.matched_transaction_id ?? null,
-          detail: `Duplicate of receipt #${priorReceipt.id} (same ${effectiveSource} total/date) — ignored`
-        });
-        summary.push({ messageId, status: "duplicate_receipt" });
-        continue;
-      }
-      const txn = await findMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
-      if (!txn) {
-        // No still-pending transaction to attach to. Distinguish "one exists
-        // but was already resolved by something else in the meantime" (a
-        // vendor/amount/date match was found, but that transaction is
-        // already categorized — keep parsed_json so the user can review the
-        // freshly-scanned items and decide whether to override it) from
-        // "nothing has arrived yet" (keep parsed_json around so a later
-        // Plaid sync can claim it).
-        const alreadyResolved = await findAnyMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
-        if (alreadyResolved) {
-          await recordProcessedReceiptEmail(env, {
-            messageId,
-            source: effectiveSource,
-            status: "already_complete",
-            receiptTotal: parsed.total,
-            receiptDate: parsed.date,
-            parsedJson: parsed,
-            matchedTransactionId: alreadyResolved.id,
-            detail: "Matching transaction was already categorized before this receipt was processed — flagged for review."
-          });
-          summary.push({ messageId, status: "already_complete", transactionId: alreadyResolved.id });
-          continue;
-        }
-        await recordProcessedReceiptEmail(env, {
-          messageId,
-          source: effectiveSource,
-          status: "no_transaction_match",
-          receiptTotal: parsed.total,
-          receiptDate: parsed.date,
-          parsedJson: parsed
-        });
-        summary.push({ messageId, status: "no_transaction_match" });
-        continue;
-      }
-      const result = await applyReceiptResult(env, txn.id, parsed, txn.amount, { merchant: txn.merchant, source: effectiveSource });
-      await recordProcessedReceiptEmail(env, {
-        messageId,
-        source: effectiveSource,
-        status: result.outcome,
-        receiptTotal: parsed.total,
-        receiptDate: parsed.date,
-        parsedJson: parsed,
-        matchedTransactionId: txn.id,
-        detail: result.summary
-      });
-      summary.push({ messageId, status: result.outcome, transactionId: txn.id });
-      ctx.waitUntil(sendPushNotification(env, {
-        title: result.outcome === "needs_review" ? `Receipt needs review: ${txn.merchant || source}` : `Auto-categorized: ${txn.merchant || source}`,
-        body: result.outcome === "needs_review" ? `$${txn.amount.toFixed(2)} — tap to categorize manually` : `$${txn.amount.toFixed(2)} — ${result.summary}`,
-        transactionId: txn.id
-      }));
+      summary.push(await finalizeParsedReceipt(env, ctx, messageId, source, extraction.parsed));
     } catch (err) {
       console.error(`Receipt processing failed for message ${messageId}:`, err);
       await recordProcessedReceiptEmail(env, { messageId, source, status: "parse_error", detail: err.message });
@@ -2380,7 +2449,88 @@ async function runAllReceiptSources(env, ctx) {
     results: [...inStore.results, ...amazon.results, ...ebay.results]
   };
 }
+// Small whitelist of app-wide config values backed by the generic
+// app_settings key/value table — currently just the local folder the
+// receipt-screenshot watcher script polls, editable from the Settings tab
+// instead of being hardcoded per machine.
+var DEFAULT_RECEIPT_SCREENSHOT_WATCH_FOLDER = "~/Pictures/AmazonReceipts";
+// The watcher script does `Path(raw).expanduser()` against whatever string
+// is stored here, so this only needs to guard against inputs that would
+// resolve somewhere the user didn't mean: empty/whitespace-only, stray
+// control characters from a bad paste, backslash-style separators, doubled
+// slashes, a trailing slash, or a relative path (which would resolve against
+// the watcher's own working directory instead of the user's chosen folder).
+// Returns null for anything that doesn't normalize into a usable path.
+function normalizeWatchFolderPath(raw) {
+  if (typeof raw !== "string") return null;
+  let path = raw.trim();
+  if (!path || path.length > 500) return null;
+  if (/[\x00-\x1f]/.test(path)) return null;
+  path = path.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  if (path.length > 1) path = path.replace(/\/+$/, "");
+  if (!(path.startsWith("/") || path.startsWith("~"))) return null;
+  return path;
+}
+__name(normalizeWatchFolderPath, "normalizeWatchFolderPath");
+async function handleGetSettings(env) {
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'receipt_screenshot_watch_folder'").first();
+  return jsonResponse({
+    receiptScreenshotWatchFolder: row?.value || DEFAULT_RECEIPT_SCREENSHOT_WATCH_FOLDER
+  });
+}
+__name(handleGetSettings, "handleGetSettings");
+async function handleUpdateSettings(request, env) {
+  const body = await request.json();
+  const folder = normalizeWatchFolderPath(body.receiptScreenshotWatchFolder);
+  if (!folder) {
+    return jsonResponse({ error: "receiptScreenshotWatchFolder must be a non-empty absolute path (starting with / or ~)" }, 400);
+  }
+  await env.DB.prepare(
+    `INSERT INTO app_settings (key, value) VALUES ('receipt_screenshot_watch_folder', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).bind(folder).run();
+  return jsonResponse({ success: true, receiptScreenshotWatchFolder: folder });
+}
+__name(handleUpdateSettings, "handleUpdateSettings");
 __name(runAllReceiptSources, "runAllReceiptSources");
+// Manually screenshotted order-summary pages (any retailer — Claude
+// identifies which one) come in one at a time from a local watched folder,
+// not a Gmail inbox scan — no candidate list to diff against, so the
+// messageId dedup key is a content hash of the image itself (catches the
+// exact same file being re-uploaded) while finalizeParsedReceipt's
+// total+date content check catches the same order screenshotted twice under
+// a different filename.
+async function handleReceiptScreenshotUpload(request, env, ctx) {
+  const providedSecret = request.headers.get("X-Budget-Secret");
+  if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+  const mimeType = request.headers.get("Content-Type") || "image/png";
+  if (!mimeType.startsWith("image/")) {
+    return jsonResponse({ error: "Expected an image body (Content-Type: image/png)" }, 400);
+  }
+  const imageBytes = new Uint8Array(await request.arrayBuffer());
+  if (imageBytes.length === 0) {
+    return jsonResponse({ error: "Empty image body" }, 400);
+  }
+  const messageId = `screenshot:${await sha256HexBytes(imageBytes)}`;
+  const existing = await env.DB.prepare(
+    "SELECT status FROM processed_receipt_emails WHERE gmail_message_id = ?"
+  ).bind(messageId).first();
+  if (existing) {
+    return jsonResponse({ success: true, status: existing.status, alreadyProcessed: true });
+  }
+  try {
+    const parsed = await parseAndCategorizeReceiptScreenshot(env, imageBytes, mimeType);
+    const result = await finalizeParsedReceipt(env, ctx, messageId, "screenshot", parsed);
+    return jsonResponse({ success: true, ...result });
+  } catch (err) {
+    console.error("Receipt screenshot processing failed:", err);
+    await recordProcessedReceiptEmail(env, { messageId, source: "screenshot", status: "parse_error", detail: err.message });
+    return jsonResponse({ error: "Screenshot processing failed: " + (err.message || String(err)) }, 500);
+  }
+}
+__name(handleReceiptScreenshotUpload, "handleReceiptScreenshotUpload");
 async function handleReceiptCheckNow(request, env, ctx) {
   const providedSecret = request.headers.get("X-Budget-Secret");
   if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {

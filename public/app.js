@@ -279,6 +279,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-csv-import')?.addEventListener('click', () => document.getElementById('csv-file-input')?.click());
   document.getElementById('csv-file-input')?.addEventListener('change', importCSVTransactions);
 
+  // Receipt screenshot watch-folder setting
+  loadSettings();
+  document.getElementById('btn-save-receipt-folder')?.addEventListener('click', saveReceiptScreenshotFolder);
+
   if (new URLSearchParams(window.location.search).get('pending')) {
     await loadAll();
     showApp();
@@ -2707,6 +2711,70 @@ async function saveNotes() {
     console.error('Save notes and category failed:', err);
     // Show the exact error message from the backend
     alert(`Failed to save changes: ${err.message}`);
+  }
+}
+
+// ============================================================
+// App Settings (receipt screenshot watch folder, etc.)
+// ============================================================
+
+async function loadSettings() {
+  try {
+    const response = await fetch('/api/settings');
+    if (!response.ok) return;
+    const settings = await response.json();
+    const input = document.getElementById('receipt-screenshot-folder');
+    if (input) input.value = settings.receiptScreenshotWatchFolder || '';
+  } catch (err) {
+    console.error('Failed to load settings:', err);
+  }
+}
+
+// Mirrors normalizeWatchFolderPath in src/index.js — the server re-validates
+// independently since it's the source of truth other machines' watcher
+// scripts read from, but checking here first gives instant feedback instead
+// of a round-trip for an obviously bad path.
+function normalizeWatchFolderPath(raw) {
+  if (typeof raw !== 'string') return null;
+  let path = raw.trim();
+  if (!path || path.length > 500) return null;
+  if (/[\x00-\x1f]/.test(path)) return null;
+  path = path.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  if (path.length > 1) path = path.replace(/\/+$/, '');
+  if (!(path.startsWith('/') || path.startsWith('~'))) return null;
+  return path;
+}
+
+async function saveReceiptScreenshotFolder() {
+  const input = document.getElementById('receipt-screenshot-folder');
+  const btn = document.getElementById('btn-save-receipt-folder');
+  const folder = normalizeWatchFolderPath(input?.value);
+  if (!folder) {
+    alert('Please enter a valid absolute folder path (starting with / or ~), e.g. ~/Pictures/AmazonReceipts');
+    return;
+  }
+  input.value = folder;
+
+  btn.disabled = true;
+  try {
+    const response = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ receiptScreenshotWatchFolder: folder }),
+    });
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || `Save failed: ${response.status}`);
+    }
+    btn.textContent = 'Saved ✓';
+    setTimeout(() => {
+      btn.textContent = 'Save';
+      btn.disabled = false;
+    }, 1500);
+  } catch (err) {
+    console.error('Failed to save receipt screenshot folder:', err);
+    alert(`Failed to save: ${err.message}`);
+    btn.disabled = false;
   }
 }
 
