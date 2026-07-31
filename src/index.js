@@ -2260,6 +2260,16 @@ async function notifyGmailAuthFailureIfNeeded(env, ctx) {
   ctx.waitUntil(notifyMacroDroid(env, "⚠️ Gmail receipt connection broken — refresh token needs renewal."));
 }
 __name(notifyGmailAuthFailureIfNeeded, "notifyGmailAuthFailureIfNeeded");
+// Fraction of items a parse is confident about (0-1) — used only to compare
+// two parses of the same order (e.g. a vague tracker-email fallback vs. a
+// later, more detailed screenshot) and decide whether the newer one is an
+// upgrade worth replacing the old one with. -1 for a missing/empty parse so
+// any real parse always beats it.
+function receiptQualityScore(parsed) {
+  if (!parsed || !Array.isArray(parsed.items) || parsed.items.length === 0) return -1;
+  return parsed.items.filter((i) => !i.uncertain).length / parsed.items.length;
+}
+__name(receiptQualityScore, "receiptQualityScore");
 // Takes an already-parsed receipt (from an email attachment/body OR a
 // manually uploaded screenshot) through dedup, transaction matching, and
 // categorization. `messageId` is whatever unique key the caller dedups on —
@@ -2297,23 +2307,40 @@ async function finalizeParsedReceipt(env, ctx, messageId, source, parsed) {
   // re-scan can never masquerade as a second real purchase or a "conflict"
   // needing the user's attention.
   const priorReceipt = await env.DB.prepare(
-    `SELECT id, matched_transaction_id FROM processed_receipt_emails
+    `SELECT id, gmail_message_id, status, matched_transaction_id, parsed_json FROM processed_receipt_emails
     WHERE source = ? AND receipt_total = ? AND receipt_date = ?
       AND status IN ('matched', 'needs_review', 'no_transaction_match', 'already_complete', 'dismissed')
     LIMIT 1`
   ).bind(effectiveSource, parsed.total, parsed.date).first();
   if (priorReceipt) {
-    await recordProcessedReceiptEmail(env, {
-      messageId,
-      source: effectiveSource,
-      status: "duplicate_receipt",
-      receiptTotal: parsed.total,
-      receiptDate: parsed.date,
-      parsedJson: parsed,
-      matchedTransactionId: priorReceipt.matched_transaction_id ?? null,
-      detail: `Duplicate of receipt #${priorReceipt.id} (same ${effectiveSource} total/date) — ignored`
-    });
-    return { messageId, status: "duplicate_receipt" };
+    // A 'no_transaction_match'/'already_complete' prior record never had its
+    // data actually applied to a transaction — it's just a placeholder
+    // (e.g. Amazon's title-less "order tracker" email fallback) sitting
+    // around waiting. If a later, richer parse for that same order shows up
+    // (e.g. the user follows up with an order-summary screenshot), treat it
+    // as an upgrade rather than a discarded duplicate: reuse the prior
+    // record's identity so it gets overwritten in place — and continue on
+    // to re-attempt transaction matching below instead of stopping here,
+    // since a transaction may have posted in the meantime too. Only do this
+    // when the new data isn't a downgrade (fewer confidently-categorized
+    // items than what's already on file).
+    const priorUnresolved = priorReceipt.status === "no_transaction_match" || priorReceipt.status === "already_complete";
+    const priorParsed = priorReceipt.parsed_json ? JSON.parse(priorReceipt.parsed_json) : null;
+    if (priorUnresolved && receiptQualityScore(parsed) >= receiptQualityScore(priorParsed)) {
+      messageId = priorReceipt.gmail_message_id;
+    } else {
+      await recordProcessedReceiptEmail(env, {
+        messageId,
+        source: effectiveSource,
+        status: "duplicate_receipt",
+        receiptTotal: parsed.total,
+        receiptDate: parsed.date,
+        parsedJson: parsed,
+        matchedTransactionId: priorReceipt.matched_transaction_id ?? null,
+        detail: `Duplicate of receipt #${priorReceipt.id} (same ${effectiveSource} total/date) — ignored`
+      });
+      return { messageId, status: "duplicate_receipt" };
+    }
   }
   const txn = await findMatchingTransaction(env, effectiveSource, parsed.date, parsed.total);
   if (!txn) {
@@ -2448,15 +2475,22 @@ function processEbayReceipts(env, ctx) {
   return processOrderEmailReceipts(env, ctx, "ebay", listUnprocessedEbayReceiptEmails, parseAndCategorizeEbayEmail);
 }
 __name(processEbayReceipts, "processEbayReceipts");
+// Amazon stopped naming products in most order-confirmation emails, so the
+// email pipeline now produces only vague/uncertain placeholders — no longer
+// worth running (the forwarding rule that fed it has been removed too).
+// Superseded by the screenshot-upload pipeline (parseAndCategorizeReceiptScreenshot),
+// which reads the real per-item titles straight off the order-summary page.
+// processAmazonReceipts/parseAndCategorizeAmazonEmail are left in place,
+// just no longer invoked here, in case Amazon's email format becomes usable
+// again later.
 async function runAllReceiptSources(env, ctx) {
-  const [inStore, amazon, ebay] = await Promise.all([
+  const [inStore, ebay] = await Promise.all([
     processInStoreReceipts(env, ctx),
-    processAmazonReceipts(env, ctx),
     processEbayReceipts(env, ctx)
   ]);
   return {
-    count: inStore.count + amazon.count + ebay.count,
-    results: [...inStore.results, ...amazon.results, ...ebay.results]
+    count: inStore.count + ebay.count,
+    results: [...inStore.results, ...ebay.results]
   };
 }
 // Small whitelist of app-wide config values backed by the generic
@@ -2556,7 +2590,7 @@ async function handleReceiptSyncNow(env, ctx) {
 __name(handleReceiptSyncNow, "handleReceiptSyncNow");
 async function handleReceiptStatus(env) {
   const { results: runRows } = await env.DB.prepare(
-    "SELECT source, last_run_at, last_run_count FROM receipt_job_runs WHERE source IN ('walmart', 'amazon', 'ebay')"
+    "SELECT source, last_run_at, last_run_count FROM receipt_job_runs WHERE source IN ('walmart', 'ebay')"
   ).all();
   const lastRunAt = runRows.reduce((max, r) => (r.last_run_at && (!max || r.last_run_at > max) ? r.last_run_at : max), null);
   const lastRunCount = runRows.some((r) => r.last_run_count != null)
