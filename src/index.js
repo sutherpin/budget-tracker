@@ -1873,6 +1873,15 @@ subtotal line as "subtotal" and the tax line as "taxTotal"; use the grand/order 
 makes the items sum to the subtotal, or as its own "Shipping" item categorized as "Misc" if it
 doesn't cleanly attribute to one item.
 
+Item titles are frequently long and wrap across two or more lines, or run right up against the
+item's price/thumbnail. Transcribe each title completely and exactly, start to end — read every
+wrapped line of it, not just the first line or the first few words. Do not shorten, summarize,
+or abbreviate a title down to an initial fragment (e.g. never truncate "T410XL Ink for Epson
+Expression XP-830..." down to just "T410XL" or "T4") — if you can only clearly make out part of
+a title because the image is blurry, cropped, or cut off, use as much of it as you can actually
+read and set "uncertain" to true rather than presenting a partial fragment as if it were the
+complete, confident title.
+
 Convert the order date to strict ISO 8601 (YYYY-MM-DD), regardless of the format printed on the
 page.
 
@@ -1882,10 +1891,11 @@ If no existing category fits well, choose a short, sensible new category name in
 forcing a bad match.
 
 Since this screenshot shows the real product title for every item (not a vague category
-summary), you should rarely need "uncertain: true" here — set it only when a title is genuinely
-ambiguous about what it actually is. Listing titles on a page like this are already full product
-names, so leave "friendlyName" as an empty string for every item — there's nothing cryptic here
-to translate.
+summary), you should rarely need "uncertain: true" for categorization confidence — set it when
+you're not confident in the category, OR per the title-transcription rule above when a title
+itself might be incomplete. Listing titles on a page like this are already full product names,
+so leave "friendlyName" as an empty string for every item — there's nothing cryptic here to
+translate.
 
 Respond with structured JSON only, matching the given schema.`;
   return callClaudeForReceipt(env, [contentBlock, { type: "text", text: prompt }], "receipt screenshot");

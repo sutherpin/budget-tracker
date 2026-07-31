@@ -1822,6 +1822,26 @@ html, body {
   font-family: inherit;
   font-size: 13px;
 }
+/* On a narrow phone viewport, the fixed-width category dropdown (150px) and
+   amount column squeeze the description down to just a couple of characters
+   before its ellipsis kicks in — e.g. a real Amazon/eBay listing title like
+   "T410XL Ink for Epson Expression..." rendering as just "T4". Stack the
+   description onto its own full-width line instead of fighting the other
+   columns for space, and let it wrap rather than clip. */
+@media (max-width: 480px) {
+  .split-item-row {
+    flex-wrap: wrap;
+  }
+  .split-item-desc-wrap {
+    flex: 1 1 100%;
+  }
+  .split-item-desc,
+  .split-item-friendly {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+}
 .btn-add-split-row {
   width: 100%;
   background: transparent;
