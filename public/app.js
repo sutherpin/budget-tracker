@@ -823,8 +823,8 @@ function renderUnclaimedReceipts(receipts) {
 async function openMatchReceiptModal(receipt) {
   const merchantLabel = receiptMerchantLabel(receipt.source);
   const labelText = receipt.status === 'already_complete'
-    ? `$${receipt.receipt_total.toFixed(2)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) already matched a categorized transaction — re-categorize to:`
-    : `Attach $${receipt.receipt_total.toFixed(2)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) to:`;
+    ? `${fmt(receipt.receipt_total)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) already matched a categorized transaction — re-categorize to:`
+    : `Attach ${fmt(receipt.receipt_total)} ${merchantLabel} receipt (${formatDate(receipt.receipt_date)}) to:`;
   document.getElementById('match-receipt-label').textContent = labelText;
   renderReceiptItemsNote(document.getElementById('match-receipt-items'), receiptItemsNoteText(receipt));
   const listEl = document.getElementById('match-receipt-candidates');
@@ -900,7 +900,7 @@ function closeMatchReceiptModal() {
 
 async function openReturnMatchModal(txn) {
   state.currentReturnTxn = txn;
-  document.getElementById('return-match-label').textContent = `${txn.merchant} credited $${txn.amount.toFixed(2)} on ${formatDate(txn.occurred_at)} — what was returned?`;
+  document.getElementById('return-match-label').textContent = `${txn.merchant} credited ${fmt(txn.amount)} on ${formatDate(txn.occurred_at)} — what was returned?`;
   const suggestedEl = document.getElementById('return-match-suggested');
   const listEl = document.getElementById('return-match-candidates');
   suggestedEl.innerHTML = '';
@@ -1363,8 +1363,8 @@ function renderDashboard(data) {
   const totalBudgeted = data.categories.reduce((s, c) => s + c.allotted, 0);
   const totalSpent = data.categories.reduce((s, c) => s + c.spent, 0);
 
-  document.getElementById('stat-budgeted').textContent = fmt(totalBudgeted);
-  document.getElementById('stat-spent').textContent = fmt(totalSpent);
+  document.getElementById('stat-budgeted').textContent = fmtRound(totalBudgeted);
+  document.getElementById('stat-spent').textContent = fmtRound(totalSpent);
   renderRunway();
   const remaining = totalBudgeted - totalSpent;
   const pieRemainingEl = document.getElementById('pie-remaining');
@@ -1384,7 +1384,7 @@ function renderDashboard(data) {
     const remaining = cat.allotted - cat.spent;
     const overBudget = remaining < 0;
     const rolloverNote = cat.rollover && cat.rolledOver
-      ? `<div class="cat-rollover-note">🔁 ${cat.rolledOver >= 0 ? '+' : '-'}${fmt(Math.abs(cat.rolledOver))} rolled ${cat.rolledOver >= 0 ? 'in' : '(deficit)'} from prior months</div>`
+      ? `<div class="cat-rollover-note">🔁 ${cat.rolledOver >= 0 ? '+' : '-'}${fmtRound(Math.abs(cat.rolledOver))} rolled ${cat.rolledOver >= 0 ? 'in' : '(deficit)'} from prior months</div>`
       : '';
     const card = document.createElement('div');
     card.className = 'cat-card';
@@ -1392,7 +1392,7 @@ function renderDashboard(data) {
       <div class="cat-icon">${cat.icon}</div>
       <div class="cat-info">
         <div class="cat-name">${cat.name}</div>
-        <div class="cat-amounts">${fmt(cat.spent)} of ${fmt(cat.allotted)}</div>
+        <div class="cat-amounts">${fmtRound(cat.spent)} of ${fmtRound(cat.allotted)}</div>
         ${rolloverNote}
         ${cat.note ? `<div class="cat-note">${cat.note}</div>` : ''}
         <div class="cat-bar-wrap">
@@ -1400,7 +1400,7 @@ function renderDashboard(data) {
         </div>
       </div>
       <div class="cat-remaining" style="color:${overBudget ? 'var(--danger)' : 'var(--accent)'}">
-        ${overBudget ? '-' : ''}${fmt(Math.abs(remaining))}
+        ${overBudget ? '-' : ''}${fmtRound(Math.abs(remaining))}
       </div>
     `;
     card.addEventListener('click', () => openCategoryDetail(cat));
@@ -1460,8 +1460,8 @@ async function renderRunway() {
   const budgetedPhrase = runwayPhrase(balance, budgetedDaily);
   const budgetedEl = document.getElementById('runway-budgeted');
   if (budgetedPhrase) {
-    budgetedEl.textContent = `Budgeted ${fmt(totalBudgeted)}/mo (${fmt(budgetedDaily)}/day): `
-      + `${fmt(balance)} lasts ${budgetedPhrase}.`;
+    budgetedEl.textContent = `Budgeted ${fmtRound(totalBudgeted)}/mo (${fmtRound(budgetedDaily)}/day): `
+      + `${fmtRound(balance)} lasts ${budgetedPhrase}.`;
     budgetedEl.classList.remove('hidden');
   } else {
     budgetedEl.classList.add('hidden');
@@ -1474,8 +1474,8 @@ async function renderRunway() {
   const actualDaily = trailing ? trailing.spent / trailing.days : 0;
   const actualPhrase = runwayPhrase(balance, actualDaily);
   if (actualPhrase) {
-    actualEl.textContent = `Actual ${fmt(trailing.spent)} in the last ${trailing.days} days `
-      + `(${fmt(actualDaily)}/day): ${fmt(balance)} lasts ${actualPhrase}.`;
+    actualEl.textContent = `Actual ${fmtRound(trailing.spent)} in the last ${trailing.days} days `
+      + `(${fmtRound(actualDaily)}/day): ${fmtRound(balance)} lasts ${actualPhrase}.`;
     actualEl.classList.remove('hidden');
   } else {
     actualEl.textContent = `No spending recorded in the last ${RUNWAY_WINDOW_DAYS} days.`;
@@ -1626,7 +1626,7 @@ function showChartTooltip(tooltipId, wrap, data, clientX, clientY) {
   const wrapRect = wrap.getBoundingClientRect();
   tooltip.innerHTML = `
     <div class="pie-tooltip-name"><span class="pie-tooltip-swatch" style="background:${data.color}"></span>${data.icon || ''} ${data.label}</div>
-    <div class="pie-tooltip-amount">${fmt(data.amount)}</div>
+    <div class="pie-tooltip-amount">${fmtRound(data.amount)}</div>
   `;
   tooltip.style.left = `${clientX - wrapRect.left}px`;
   tooltip.style.top = `${clientY - wrapRect.top}px`;
@@ -1698,7 +1698,7 @@ function renderMiniLegend(containerId, cats, valueFn, emptyText) {
     row.innerHTML = `
       <span class="mini-pie-legend-swatch" style="background:${cat.color}"></span>
       <span class="mini-pie-legend-name">${cat.icon || ''} ${cat.name}</span>
-      <span class="mini-pie-legend-amount">${fmt(valueFn(cat))}</span>
+      <span class="mini-pie-legend-amount">${fmtRound(valueFn(cat))}</span>
     `;
     container.appendChild(row);
   });
@@ -1718,7 +1718,7 @@ async function openCategoryDetail(cat) {
 
   iconEl.textContent = cat.icon || '🏷️';
   nameEl.textContent = cat.name;
-  summaryEl.textContent = `${fmt(cat.spent)} of ${fmt(cat.allotted)} spent`;
+  summaryEl.textContent = `${fmtRound(cat.spent)} of ${fmtRound(cat.allotted)} spent`;
   if (noteEl) noteEl.value = cat.note || '';
   listEl.innerHTML = '<div class="empty-state">Loading…</div>';
   modal.classList.remove('hidden');
@@ -2334,8 +2334,22 @@ async function switchView(name) {
   }
 }
 
+// Cents are the default: anywhere an amount might be reconciled against a
+// bank line or a receipt (transactions, pending, receipts, splits, duplicates,
+// balances) the exact figure is what makes matching possible.
 function fmt(amount) {
   return '$' + (amount || 0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// Whole dollars, for the at-a-glance rollups only — Dashboard category cards
+// and totals, and the Stats charts. Nothing here is matched against a
+// statement, so the cents are just noise.
+function fmtRound(amount) {
+  const n = Math.round(amount || 0);
+  // Group from the digits only, so the sign can't be mistaken for a digit
+  // boundary on negative thousands (-12345 -> -12,345).
+  const grouped = Math.abs(n).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (n < 0 ? '-$' : '$') + grouped;
 }
 
 function formatDate(dateStr) {
@@ -2363,7 +2377,7 @@ function animateNumber(el, target) {
     const progress = Math.min(elapsed / duration, 1);
     const eased = 1 - Math.pow(1 - progress, 3);
     const current = start + (target - start) * eased;
-    el.textContent = fmt(current);
+    el.textContent = fmtRound(current);
     if (progress < 1) requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
@@ -2742,7 +2756,7 @@ function renderItemCategoryRows(containerEl, items, { transactionId, returnable 
 async function returnTransactionItem(transactionId, itemIndex, item, itemCount) {
   const isLastItem = itemCount === 1;
   const confirmMessage = isLastItem
-    ? `Mark "${item.description}" (${fmt(item.amount)}) as returned? This is the only item on the receipt, so the whole $${item.amount.toFixed(2)} transaction will be deleted.`
+    ? `Mark "${item.description}" (${fmt(item.amount)}) as returned? This is the only item on the receipt, so the whole ${fmt(item.amount)} transaction will be deleted.`
     : `Mark "${item.description}" (${fmt(item.amount)}) as returned? It'll be removed from this transaction and your budget.`;
   if (!confirm(confirmMessage)) return;
 
