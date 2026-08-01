@@ -498,10 +498,33 @@ async function findPotentialDuplicate(env, transaction) {
   return null;
 }
 __name(findPotentialDuplicate, "findPotentialDuplicate");
+// Cloudflare Workers always run in UTC regardless of where the user actually
+// is — plain `new Date()` + `.getFullYear()`/`.getMonth()` silently compute
+// the UTC calendar date, which rolls over to a new day/month hours before
+// the user's real local date does (e.g. 5pm Pacific in summer is already
+// past midnight UTC). Every "what's today/this month" calculation needs to
+// go through this instead of a bare `new Date()`.
+var APP_TIMEZONE = "America/Los_Angeles";
+function todayInAppTimezone() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: APP_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(/* @__PURE__ */ new Date());
+}
+__name(todayInAppTimezone, "todayInAppTimezone");
+function currentMonthInAppTimezone() {
+  return todayInAppTimezone().slice(0, 7);
+}
+__name(currentMonthInAppTimezone, "currentMonthInAppTimezone");
+function currentHourInAppTimezone() {
+  return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: APP_TIMEZONE, hour: "2-digit", hourCycle: "h23" }).format(/* @__PURE__ */ new Date()), 10);
+}
+__name(currentHourInAppTimezone, "currentHourInAppTimezone");
+function isLastDayOfMonthInAppTimezone() {
+  const [y, m, d] = todayInAppTimezone().split("-").map(Number);
+  const tomorrow = new Date(Date.UTC(y, m - 1, d + 1));
+  return tomorrow.getUTCMonth() + 1 !== m;
+}
+__name(isLastDayOfMonthInAppTimezone, "isLastDayOfMonthInAppTimezone");
 function isCurrentMonth(transactionDate) {
-  const txnDate = new Date(transactionDate);
-  const now = /* @__PURE__ */ new Date();
-  return txnDate.getFullYear() === now.getFullYear() && txnDate.getMonth() === now.getMonth();
+  return String(transactionDate).slice(0, 7) === currentMonthInAppTimezone();
 }
 __name(isCurrentMonth, "isCurrentMonth");
 var AUTO_CATEGORY_RULES = [
@@ -789,6 +812,9 @@ var index_default = {
       if (url.pathname === "/api/receipts/sync-now" && request.method === "POST") {
         return await handleReceiptSyncNow(env, ctx);
       }
+      if (url.pathname === "/share-receipt" && request.method === "POST") {
+        return await handleShareTargetReceipt(request, env, ctx);
+      }
       if (url.pathname === "/api/receipts/status" && request.method === "GET") {
         return await handleReceiptStatus(env);
       }
@@ -910,7 +936,7 @@ var index_default = {
         return await handleTestTransactions(env);
       }
       if (url.pathname === "/api/test-dashboard-query" && request.method === "GET") {
-        const month = url.searchParams.get("month") || (/* @__PURE__ */ new Date()).toISOString().slice(0, 7);
+        const month = url.searchParams.get("month") || currentMonthInAppTimezone();
         const { results } = await env.DB.prepare(
           `SELECT
           c.id AS categoryId,
@@ -949,8 +975,10 @@ var index_default = {
     }
     if (event.cron === "*/30 * * * *") {
       ctx.waitUntil(processInStoreReceipts(env, ctx).catch((err) => console.error("Scheduled in-store receipt check failed:", err)));
-      ctx.waitUntil(processAmazonReceipts(env, ctx).catch((err) => console.error("Scheduled Amazon receipt check failed:", err)));
+      // Amazon's email pipeline is disabled (see runAllReceiptSources) — it
+      // was still being called directly here, independent of that switch.
       ctx.waitUntil(processEbayReceipts(env, ctx).catch((err) => console.error("Scheduled eBay receipt check failed:", err)));
+      ctx.waitUntil(takeMonthEndSnapshotIfDue(env).catch((err) => console.error("Month-end budget snapshot failed:", err)));
     }
   }
 };
@@ -2575,6 +2603,98 @@ async function handleReceiptScreenshotUpload(request, env, ctx) {
   }
 }
 __name(handleReceiptScreenshotUpload, "handleReceiptScreenshotUpload");
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+__name(escapeHtml, "escapeHtml");
+var RECEIPT_STATUS_DESCRIPTIONS = {
+  matched: "Matched to a transaction and categorized automatically.",
+  needs_review: "Matched to a transaction, but needs a quick manual category review.",
+  no_transaction_match: "No matching bank transaction yet — saved, and will attach automatically once it posts.",
+  already_complete: "A matching transaction was found but was already categorized by something else — flagged for review.",
+  duplicate_receipt: "A receipt for this same order/date/total was already on file.",
+  not_a_receipt: "This didn't look like a receipt or order-summary page — nothing was saved.",
+  parse_error: "Something went wrong reading this image."
+};
+// Minimal standalone HTML page (not part of the SPA) shown right in the
+// Android share sheet's browser tab after sharing an image into the app —
+// this request is a real page navigation (the OS share sheet does a POST
+// navigation to the manifest's share_target action), so it needs an actual
+// HTML response, not JSON.
+function shareTargetResultPage(title, message, ok) {
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:#0f1729; color:#e8ecf5; font-family:'DM Sans', system-ui, sans-serif; }
+  .card { max-width:360px; padding:32px 24px; text-align:center; }
+  .icon { font-size:48px; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0 0 8px; }
+  p { color:#9aa4bd; font-size:15px; line-height:1.5; }
+  a { display:inline-block; margin-top:20px; padding:10px 20px; background:#22c55e; color:#0f1729;
+    border-radius:8px; text-decoration:none; font-weight:600; }
+</style></head>
+<body>
+  <div class="card">
+    <div class="icon">${ok ? "✅" : "⚠️"}</div>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+    <a href="/?pending=1">OK</a>
+  </div>
+</body></html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+__name(shareTargetResultPage, "shareTargetResultPage");
+// Handles Android's native Share sheet sending an image straight into the
+// app (manifest.json's share_target) — same underlying pipeline as
+// handleReceiptScreenshotUpload (parseAndCategorizeReceiptScreenshot +
+// finalizeParsedReceipt, same content-hash dedup), but reads a multipart
+// form instead of a raw body, and skips the X-Budget-Secret check since the
+// OS share sheet can't attach custom headers and this request can only
+// originate from the app already installed on the user's own phone (every
+// other endpoint in this app is equally unauthenticated already).
+async function handleShareTargetReceipt(request, env, ctx) {
+  let file;
+  try {
+    const form = await request.formData();
+    file = form.get("receipt");
+  } catch (err) {
+    return shareTargetResultPage("Upload failed", "Could not read the shared file.", false);
+  }
+  if (!file || typeof file === "string" || !file.type || !file.type.startsWith("image/")) {
+    return shareTargetResultPage("Upload failed", "No image was shared, or the shared file wasn't an image.", false);
+  }
+  const imageBytes = new Uint8Array(await file.arrayBuffer());
+  if (imageBytes.length === 0) {
+    return shareTargetResultPage("Upload failed", "The shared image was empty.", false);
+  }
+  const mimeType = file.type;
+  const messageId = `screenshot:${await sha256HexBytes(imageBytes)}`;
+  const existing = await env.DB.prepare(
+    "SELECT status FROM processed_receipt_emails WHERE gmail_message_id = ?"
+  ).bind(messageId).first();
+  if (existing) {
+    return shareTargetResultPage("Already processed", RECEIPT_STATUS_DESCRIPTIONS[existing.status] || existing.status, true);
+  }
+  try {
+    const parsed = await parseAndCategorizeReceiptScreenshot(env, imageBytes, mimeType);
+    const result = await finalizeParsedReceipt(env, ctx, messageId, "screenshot", parsed);
+    const description = RECEIPT_STATUS_DESCRIPTIONS[result.status] || result.status;
+    const ok = result.status !== "parse_error" && result.status !== "not_a_receipt";
+    return shareTargetResultPage(ok ? "Receipt processed" : "Not processed", description, ok);
+  } catch (err) {
+    console.error("Share-target receipt processing failed:", err);
+    await recordProcessedReceiptEmail(env, { messageId, source: "screenshot", status: "parse_error", detail: err.message });
+    return shareTargetResultPage("Processing failed", err.message || String(err), false);
+  }
+}
+__name(handleShareTargetReceipt, "handleShareTargetReceipt");
 async function handleReceiptCheckNow(request, env, ctx) {
   const providedSecret = request.headers.get("X-Budget-Secret");
   if (!providedSecret || providedSecret !== env.MACRODROID_SHARED_SECRET) {
@@ -3246,8 +3366,10 @@ async function computeRolloverAdjustedAllotted(env, categoryId, targetMonth, bas
   };
 }
 __name(computeRolloverAdjustedAllotted, "computeRolloverAdjustedAllotted");
-async function handleDashboard(env, url) {
-  const month = url.searchParams.get("month") || (/* @__PURE__ */ new Date()).toISOString().slice(0, 7);
+// The category-spend/allotted/notes summary and top-merchants list for one
+// month — split out from handleDashboard so both the live endpoint and the
+// month-end snapshot job build this the exact same way.
+async function computeDashboardMonthData(env, month) {
   const { results } = await env.DB.prepare(
     `SELECT
     c.id AS categoryId,
@@ -3313,6 +3435,45 @@ async function handleDashboard(env, url) {
     LIMIT 5`
   ).bind(month).all();
 
+  return { categories: summary, topMerchants };
+}
+__name(computeDashboardMonthData, "computeDashboardMonthData");
+// Fires from the existing 30-minute cron rather than a dedicated cron
+// expression — a fixed UTC cron time would drift an hour every DST change,
+// while checking the real Pacific-local hour on every tick sidesteps that
+// entirely. Runs harmlessly ~48 times during the correct hour; the
+// month-uniqueness check below makes actually taking the snapshot a no-op
+// after the first successful run.
+async function takeMonthEndSnapshotIfDue(env) {
+  if (currentHourInAppTimezone() !== 23 || !isLastDayOfMonthInAppTimezone()) return;
+  const month = currentMonthInAppTimezone();
+  const existing = await env.DB.prepare("SELECT 1 FROM budget_snapshots WHERE month = ?").bind(month).first();
+  if (existing) return;
+  const monthData = await computeDashboardMonthData(env, month);
+  await env.DB.prepare(
+    "INSERT INTO budget_snapshots (month, snapshot_json) VALUES (?, ?) ON CONFLICT(month) DO NOTHING"
+  ).bind(month, JSON.stringify(monthData)).run();
+}
+__name(takeMonthEndSnapshotIfDue, "takeMonthEndSnapshotIfDue");
+// A month-end snapshot only exists for a month that's genuinely over — the
+// current, still-in-progress month always uses the live query so today's
+// spending shows up immediately, never a stale/nonexistent snapshot.
+async function handleDashboard(env, url) {
+  const month = url.searchParams.get("month") || currentMonthInAppTimezone();
+  let monthData = null;
+  let snapshotTakenAt = null;
+  if (month !== currentMonthInAppTimezone()) {
+    const snapshot = await env.DB.prepare("SELECT snapshot_json, created_at FROM budget_snapshots WHERE month = ?").bind(month).first();
+    if (snapshot) {
+      monthData = JSON.parse(snapshot.snapshot_json);
+      snapshotTakenAt = snapshot.created_at;
+    }
+  }
+  if (!monthData) {
+    monthData = await computeDashboardMonthData(env, month);
+  }
+  // Always live, never frozen — this is an all-time ranking, not scoped to
+  // whichever month is being viewed.
   const { results: lifetimeTopMerchants } = await env.DB.prepare(
     `SELECT merchant, SUM(amount) AS total
     FROM transactions
@@ -3324,7 +3485,7 @@ async function handleDashboard(env, url) {
     LIMIT 5`
   ).all();
 
-  return jsonResponse({ month, categories: summary, topMerchants, lifetimeTopMerchants });
+  return jsonResponse({ month, categories: monthData.categories, topMerchants: monthData.topMerchants, lifetimeTopMerchants, snapshotTakenAt });
 }
 __name(handleDashboard, "handleDashboard");
 function jsonResponse(data, status = 200) {
@@ -3487,7 +3648,12 @@ async function handleAddRecurringTransaction(request, env) {
   const startDateISO = `${startDate}T00:00:00`;
   const endDateISO = endDate ? `${endDate}T23:59:59` : null;
   const startDateObj = new Date(startDate);
-  const today = /* @__PURE__ */ new Date();
+  // Date-only strings like startDate parse as UTC midnight, so "today" needs
+  // to be the same kind of date-only value (the user's real local calendar
+  // date, not the Worker's UTC instant) or the comparisons below silently
+  // drift by hours depending on time of day.
+  const [todayYear, todayMonthNum, todayDay] = todayInAppTimezone().split("-").map(Number);
+  const today = new Date(Date.UTC(todayYear, todayMonthNum - 1, todayDay));
   let nextDueDate;
   if (startDateObj > today) {
     nextDueDate = startDateObj;

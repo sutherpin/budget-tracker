@@ -177,10 +177,22 @@ html, body {
   top: 0;
   z-index: 10;
 }
+.topbar-month-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
 .topbar-month {
   font-size: 17px;
   font-weight: 700;
   letter-spacing: -0.02em;
+}
+.topbar-snapshot-note {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
 }
 .btn-theme-toggle {
   background: var(--bg3);

@@ -68,7 +68,13 @@ let state = {
   currentSplitTxn: null,
   currentReturnTxn: null,
   currentCategoryDetailId: null,
-  currentMonth: new Date().toISOString().slice(0, 7),
+  // .toISOString() always normalizes to UTC even though this runs in the
+  // browser's real local timezone — use local getters instead, or this
+  // flips to next month hours before the user's actual local midnight.
+  currentMonth: (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  })(),
 };
 
 let activeView = 'dashboard';
@@ -1218,6 +1224,7 @@ function renderDashboard(data) {
   const [year, month] = data.month.split('-');
   const monthName = new Date(year, parseInt(month) - 1).toLocaleString('default', { month: 'long' });
   document.getElementById('topbar-month').textContent = `${monthName} ${year}`;
+  document.getElementById('topbar-snapshot-note').classList.toggle('hidden', !data.snapshotTakenAt);
 
   const totalBudgeted = data.categories.reduce((s, c) => s + c.allotted, 0);
   const totalSpent = data.categories.reduce((s, c) => s + c.spent, 0);
