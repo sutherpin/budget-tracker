@@ -121,6 +121,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
 
+  initPullToRefresh();
+
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && activeView === 'settings') {
       saveBudgets();
@@ -321,18 +323,140 @@ function setLoadingStatus(text, percent) {
   if (fillEl) fillEl.style.width = percent + '%';
 }
 
+// ============================================================
+// Pull to refresh
+// ============================================================
+
+const PTR_TRIGGER_PX = 64;   // pull distance (after resistance) that arms a refresh
+const PTR_MAX_PX = 96;       // hard stop, so the indicator can't be dragged forever
+const PTR_RESISTANCE = 0.5;  // finger travel -> indicator travel, for a rubber-band feel
+
+function initPullToRefresh() {
+  const main = document.getElementById('main');
+  const indicator = document.getElementById('ptr-indicator');
+  const spinner = document.getElementById('ptr-spinner');
+  if (!main || !indicator) return;
+
+  let startY = 0;
+  let startX = 0;
+  let pull = 0;
+  let tracking = false;   // finger is down at the top of a scrollable view
+  let dragging = false;   // confirmed vertical pull; we own the gesture now
+  let refreshing = false;
+
+  // Each .view is its own scroll container (they're flex children with
+  // overflow-y:auto), so "are we at the top?" has to be asked of the visible
+  // one, not of document/body.
+  const activeScroller = () => document.querySelector('.view.active');
+
+  function paint(settling) {
+    indicator.classList.toggle('ptr-settling', !!settling);
+    indicator.classList.toggle('ptr-armed', pull >= PTR_TRIGGER_PX);
+    indicator.style.opacity = String(Math.min(pull / PTR_TRIGGER_PX, 1));
+    indicator.style.transform = `translateY(${pull - 8}px)`;
+    if (!refreshing) spinner.textContent = pull >= PTR_TRIGGER_PX ? '↑' : '↓';
+  }
+
+  function reset(settling) {
+    pull = 0;
+    paint(settling);
+  }
+
+  main.addEventListener('touchstart', (e) => {
+    if (refreshing || e.touches.length !== 1) return;
+    const scroller = activeScroller();
+    if (!scroller || scroller.scrollTop > 0) return;
+    startY = e.touches[0].clientY;
+    startX = e.touches[0].clientX;
+    tracking = true;
+    dragging = false;
+  }, { passive: true });
+
+  main.addEventListener('touchmove', (e) => {
+    if (!tracking || refreshing) return;
+    const dy = e.touches[0].clientY - startY;
+    const dx = e.touches[0].clientX - startX;
+
+    // Let horizontal swipes and any upward move fall through to normal
+    // scrolling — only a deliberate downward drag becomes a pull.
+    if (!dragging) {
+      if (dy <= 0 || Math.abs(dx) > Math.abs(dy)) { tracking = false; return; }
+      if (dy < 8) return; // too small to tell yet
+      dragging = true;
+    }
+    // Scrolled back down mid-gesture (momentum, or content grew): hand it back.
+    if (activeScroller().scrollTop > 0) {
+      tracking = false;
+      dragging = false;
+      reset(true);
+      return;
+    }
+    e.preventDefault(); // needs passive:false below, or this is a no-op
+    pull = Math.min(dy * PTR_RESISTANCE, PTR_MAX_PX);
+    paint(false);
+  }, { passive: false });
+
+  async function finish() {
+    if (!dragging) { tracking = false; return; }
+    const shouldRefresh = pull >= PTR_TRIGGER_PX;
+    tracking = false;
+    dragging = false;
+    if (!shouldRefresh) { reset(true); return; }
+
+    refreshing = true;
+    pull = PTR_TRIGGER_PX;
+    spinner.textContent = '⟳';
+    indicator.classList.add('ptr-refreshing');
+    paint(true);
+    try {
+      await refreshAll();
+    } finally {
+      // A refresh that finishes instantly reads as "nothing happened" — hold
+      // the spinner just long enough to register as a deliberate action.
+      setTimeout(() => {
+        refreshing = false;
+        indicator.classList.remove('ptr-refreshing');
+        reset(true);
+      }, 350);
+    }
+  }
+
+  main.addEventListener('touchend', finish, { passive: true });
+  main.addEventListener('touchcancel', () => {
+    tracking = false;
+    dragging = false;
+    if (!refreshing) reset(true);
+  }, { passive: true });
+}
+
+// Every read-only loader in the app. Deliberately excludes anything that
+// pokes Plaid (/api/plaid/sync-now) or Gmail (/api/receipts/check-now) —
+// those are explicit button actions with rate limits and side effects, not
+// something a refresh should fire. /api/plaid/balance and /api/plaid/items
+// are in here because despite the names they only read local cached tables.
+const LOAD_STEPS = [
+  { label: 'Dashboard', fn: loadDashboard },
+  { label: 'Pending transactions', fn: loadPending },
+  { label: 'Categories', fn: loadCategories },
+  { label: 'Recurring transactions', fn: loadRecurringTransactions },
+  { label: 'Account balance', fn: loadBalance },
+  { label: 'Duplicate check', fn: loadDuplicates },
+  { label: 'Receipt status', fn: loadReceiptStatus },
+  { label: 'Auto-categorization log', fn: loadAutoCategorizationLog },
+  { label: 'CSV import duplicates', fn: loadCsvDuplicates },
+];
+
+// Pull-to-refresh target: same data as startup, plus the two views that load
+// their own data lazily and so aren't in LOAD_STEPS.
+async function refreshAll() {
+  const jobs = LOAD_STEPS.map((s) => s.fn());
+  if (activeView === 'transactions') jobs.push(loadTransactions());
+  if (activeView === 'settings') jobs.push(loadLinkedAccounts());
+  await Promise.allSettled(jobs);
+}
+
 async function loadAll() {
-  const steps = [
-    { label: 'Dashboard', fn: loadDashboard },
-    { label: 'Pending transactions', fn: loadPending },
-    { label: 'Categories', fn: loadCategories },
-    { label: 'Recurring transactions', fn: loadRecurringTransactions },
-    { label: 'Account balance', fn: loadBalance },
-    { label: 'Duplicate check', fn: loadDuplicates },
-    { label: 'Receipt status', fn: loadReceiptStatus },
-    { label: 'Auto-categorization log', fn: loadAutoCategorizationLog },
-    { label: 'CSV import duplicates', fn: loadCsvDuplicates },
-  ];
+  const steps = LOAD_STEPS;
   const completedLabels = new Set();
   setLoadingStatus(`Loading ${steps.map((s) => s.label).join(', ')}…`, 5);
   await Promise.all(steps.map(async (step) => {
@@ -602,7 +726,6 @@ async function syncPlaidNow() {
     } else {
       showHeaderStatus(data.added > 0 ? `✓ Added ${data.added} new transaction(s)` : '✓ Nothing new since last check');
     }
-    trailingSpendPromise = null; // new transactions can land inside the 30-day window
     await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates(), loadLinkedAccounts()]);
     if (activeView === 'transactions') await loadTransactions();
   } catch (err) {
@@ -1092,6 +1215,13 @@ function changeMonth(delta) {
 
 async function loadDashboard() {
   try {
+    // Every path that can change spending (categorize, resolve duplicate, CSV
+    // import, manual add/edit/delete, Plaid sync) refreshes the dashboard, so
+    // dropping the trailing-spend cache here keeps the runway's actual-spend
+    // line in step without each of those having to remember to do it. Notably
+    // the trailing query only counts *categorized* purchases, so clearing a
+    // pending item changes it.
+    trailingSpendPromise = null;
     const data = await apiFetch('/api/dashboard?month=' + state.currentMonth);
     state.dashboard = data;
     renderDashboard(data);
