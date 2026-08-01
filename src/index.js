@@ -881,6 +881,9 @@ var index_default = {
       if (url.pathname === "/api/push-subscribe" && request.method === "POST") {
         return await handlePushSubscribe(request, env);
       }
+      if (url.pathname === "/api/spend-trailing" && request.method === "GET") {
+        return await handleTrailingSpend(env, url);
+      }
       if (url.pathname === "/api/dashboard" && request.method === "GET") {
         return await handleDashboard(env, url);
       }
@@ -3458,6 +3461,41 @@ __name(takeMonthEndSnapshotIfDue, "takeMonthEndSnapshotIfDue");
 // A month-end snapshot only exists for a month that's genuinely over — the
 // current, still-in-progress month always uses the live query so today's
 // spending shows up immediately, never a stale/nonexistent snapshot.
+// Trailing-window spend for the dashboard's runway line. Calendar months are
+// the wrong window there — on the 1st there's nothing to average, and a month
+// boundary makes the number lurch. Filters match computeDashboardMonthData's
+// "spent" exactly (categorized purchases, active in-budget categories, splits
+// counted at split amounts) so the two runway lines are comparing like to like.
+async function handleTrailingSpend(env, url) {
+  const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "30", 10) || 30, 1), 365);
+  const [y, m, d] = todayInAppTimezone().split("-").map(Number);
+  // days - 1 so a 30-day window is today plus the 29 days before it, not 31 days.
+  const start = new Date(Date.UTC(y, m - 1, d - (days - 1)));
+  const startDate = start.toISOString().slice(0, 10);
+  const endDate = todayInAppTimezone();
+
+  const row = await env.DB.prepare(
+    `SELECT COALESCE(SUM(spend.amount), 0) AS spent
+    FROM (
+      SELECT t.category_id AS category_id, t.amount AS amount
+      FROM transactions t
+      WHERE t.transaction_type = 'purchase' AND t.status = 'categorized' AND t.is_split = 0
+        AND date(t.occurred_at) BETWEEN ? AND ?
+      UNION ALL
+      SELECT ts.category_id AS category_id, ts.amount AS amount
+      FROM transaction_splits ts
+      JOIN transactions t ON t.id = ts.transaction_id
+      WHERE t.transaction_type = 'purchase' AND t.status = 'categorized'
+        AND date(t.occurred_at) BETWEEN ? AND ?
+    ) spend
+    JOIN categories c ON c.id = spend.category_id
+    WHERE c.is_active = 1 AND c.included_in_budget = 1`
+  ).bind(startDate, endDate, startDate, endDate).first();
+
+  return jsonResponse({ days, startDate, endDate, spent: row?.spent || 0 });
+}
+__name(handleTrailingSpend, "handleTrailingSpend");
+
 async function handleDashboard(env, url) {
   const month = url.searchParams.get("month") || currentMonthInAppTimezone();
   let monthData = null;

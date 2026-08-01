@@ -75,6 +75,7 @@ let state = {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
   })(),
+  balanceTotal: null,
 };
 
 let activeView = 'dashboard';
@@ -555,6 +556,8 @@ async function loadBalance() {
     }
     document.getElementById('account-balance-checking').textContent = fmt(data.checking ?? 0);
     document.getElementById('account-balance-savings').textContent = fmt(data.savings ?? 0);
+    state.balanceTotal = (data.checking ?? 0) + (data.savings ?? 0);
+    renderRunway();
     if (btn) {
       btn.title = data.asOf
         ? `Sync now — updated ${formatRelativeTime(data.asOf)}`
@@ -599,6 +602,7 @@ async function syncPlaidNow() {
     } else {
       showHeaderStatus(data.added > 0 ? `✓ Added ${data.added} new transaction(s)` : '✓ Nothing new since last check');
     }
+    trailingSpendPromise = null; // new transactions can land inside the 30-day window
     await Promise.all([loadDashboard(), loadPending(), loadBalance(), loadDuplicates(), loadLinkedAccounts()]);
     if (activeView === 'transactions') await loadTransactions();
   } catch (err) {
@@ -1231,6 +1235,7 @@ function renderDashboard(data) {
 
   document.getElementById('stat-budgeted').textContent = fmt(totalBudgeted);
   document.getElementById('stat-spent').textContent = fmt(totalSpent);
+  renderRunway();
   const remaining = totalBudgeted - totalSpent;
   const pieRemainingEl = document.getElementById('pie-remaining');
   pieRemainingEl.style.color = remaining < 0 ? '#ff3b30' : '#34c759';
@@ -1274,6 +1279,80 @@ function renderDashboard(data) {
       setTimeout(() => { card.querySelector('.cat-bar').style.width = pct + '%'; }, 50);
     });
   });
+}
+
+// "Runway" — how long the combined checking + savings balance lasts. Shown as
+// two lines so the plan and the reality can be compared side by side:
+//   • budgeted: the month's total allotment, spread evenly over the month
+//   • actual:   what was really spent over a trailing 30-day window
+// Both inputs arrive from separate fetches (loadBalance / loadDashboard) that
+// finish in either order, so each calls this and it renders once both are in.
+const RUNWAY_WINDOW_DAYS = 30;
+
+let trailingSpendPromise = null;
+function fetchTrailingSpend() {
+  if (!trailingSpendPromise) {
+    trailingSpendPromise = apiFetch(`/api/spend-trailing?days=${RUNWAY_WINDOW_DAYS}`)
+      .catch(() => null);
+  }
+  return trailingSpendPromise;
+}
+
+// Turns a daily burn rate into "~N days — empty around <date>".
+function runwayPhrase(balance, dailyBurn) {
+  if (!(dailyBurn > 0)) return null;
+  const daysLeft = Math.floor(balance / dailyBurn);
+  if (daysLeft > 3650) return 'over 10 years';
+  const now = new Date();
+  const outOn = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysLeft);
+  const outLabel = outOn.toLocaleDateString('default', { month: 'short', day: 'numeric', year: 'numeric' });
+  return `~${daysLeft} day${daysLeft === 1 ? '' : 's'} — empty around ${outLabel}`;
+}
+
+async function renderRunway() {
+  const wrap = document.getElementById('runway-lines');
+  if (!wrap) return;
+
+  const data = state.dashboard;
+  const balance = state.balanceTotal;
+  if (!data || balance === null || balance <= 0) {
+    wrap.classList.add('hidden');
+    return;
+  }
+
+  const [year, month] = data.month.split('-').map(Number);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const totalBudgeted = data.categories.reduce((s, c) => s + c.allotted, 0);
+
+  // Line 1 — the plan. Budget is a monthly number, so spread it evenly across
+  // the days in the month being viewed to get a comparable daily rate.
+  const budgetedDaily = totalBudgeted / daysInMonth;
+  const budgetedPhrase = runwayPhrase(balance, budgetedDaily);
+  const budgetedEl = document.getElementById('runway-budgeted');
+  if (budgetedPhrase) {
+    budgetedEl.textContent = `Budgeted ${fmt(totalBudgeted)}/mo (${fmt(budgetedDaily)}/day): `
+      + `${fmt(balance)} lasts ${budgetedPhrase}.`;
+    budgetedEl.classList.remove('hidden');
+  } else {
+    budgetedEl.classList.add('hidden');
+  }
+
+  // Line 2 — the reality. Deliberately not scoped to the viewed month: it's
+  // always the last 30 days, so it stays meaningful on the 1st of a month.
+  const trailing = await fetchTrailingSpend();
+  const actualEl = document.getElementById('runway-actual');
+  const actualDaily = trailing ? trailing.spent / trailing.days : 0;
+  const actualPhrase = runwayPhrase(balance, actualDaily);
+  if (actualPhrase) {
+    actualEl.textContent = `Actual ${fmt(trailing.spent)} in the last ${trailing.days} days `
+      + `(${fmt(actualDaily)}/day): ${fmt(balance)} lasts ${actualPhrase}.`;
+    actualEl.classList.remove('hidden');
+  } else {
+    actualEl.textContent = `No spending recorded in the last ${RUNWAY_WINDOW_DAYS} days.`;
+    actualEl.classList.remove('hidden');
+  }
+
+  wrap.classList.toggle('hidden', !budgetedPhrase && !actualPhrase);
 }
 
 const chartSlices = {}; // canvasId -> [{ startAngle, endAngle, innerR, outerR, cx, cy, data }]
